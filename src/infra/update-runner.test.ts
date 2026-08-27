@@ -140,6 +140,9 @@ describe("runGatewayUpdate", () => {
       if (key === `git -C ${tempDir} checkout --detach ${params.stableTag}`) {
         return { stdout: "", stderr: "", code: 0 };
       }
+      if (key === "pnpm --version") {
+        return { stdout: "8.0.0", stderr: "", code: 0 };
+      }
       if (key === "pnpm install") {
         return { stdout: "", stderr: "", code: 0 };
       }
@@ -337,6 +340,7 @@ describe("runGatewayUpdate", () => {
   ): Record<string, CommandResponse> {
     const tagOutput = [stableTag, ...(options?.additionalTags ?? [])].join("\n");
     return {
+      "pnpm --version": { stdout: "8.0.0" },
       [`git -C ${tempDir} rev-parse --show-toplevel`]: { stdout: tempDir },
       [`git -C ${tempDir} rev-parse HEAD`]: { stdout: "abc123" },
       [`git -C ${tempDir} status --porcelain -- :!dist/control-ui/`]: { stdout: "" },
@@ -461,7 +465,9 @@ describe("runGatewayUpdate", () => {
         return toCommandResult({ stdout: `${targetSha}\n` });
       }
       if (key === "pnpm --version") {
-        return toCommandResult({ stdout: "10.0.0" });
+        return toCommandResult({
+          stdout: (params?.packageManager ?? "pnpm@8.0.0").slice(5).split("+")[0],
+        });
       }
       if (
         key.startsWith(`git -C ${tempDir} worktree add --detach `) &&
@@ -570,6 +576,9 @@ describe("runGatewayUpdate", () => {
           cwd: options.cwd,
           timeoutMs: options.timeoutMs ?? 5000,
         });
+      }
+      if (argv[0] === "pnpm" && argv[1] === "--version") {
+        return toCommandResult({ stdout: "10.0.0" });
       }
       if (argv[0] === "pnpm" && (argv[1] === "build" || argv[1] === "ui:build")) {
         const cwd = options.cwd ?? process.cwd();
@@ -835,7 +844,7 @@ describe("runGatewayUpdate", () => {
         }),
       },
       [`git -C ${tempDir} rebase ${upstreamSha}`]: { stdout: "" },
-      "pnpm --version": { stdout: "10.0.0" },
+      "pnpm --version": { stdout: "8.0.0" },
       "pnpm install": { stdout: "" },
       "pnpm build": { stdout: "" },
       "pnpm ui:build": { stdout: "" },
@@ -1015,7 +1024,7 @@ describe("runGatewayUpdate", () => {
         return { stdout: "", stderr: "", code: 0 };
       }
       if (key === "pnpm --version") {
-        return { stdout: "10.0.0", stderr: "", code: 0 };
+        return { stdout: "8.0.0", stderr: "", code: 0 };
       }
       if (key === "pnpm install" || key === "pnpm ui:build") {
         return { stdout: "", stderr: "", code: 0 };
@@ -1124,7 +1133,7 @@ describe("runGatewayUpdate", () => {
         return { stdout: "", stderr: "", code: 0 };
       }
       if (key === "pnpm --version") {
-        return { stdout: "10.0.0", stderr: "", code: 0 };
+        return { stdout: "8.0.0", stderr: "", code: 0 };
       }
       if (key === "pnpm install" || key === "pnpm build" || key === "pnpm ui:build") {
         return { stdout: "", stderr: "", code: 0 };
@@ -1190,7 +1199,7 @@ describe("runGatewayUpdate", () => {
         stdout: `${targetSha}\n`,
       },
       [`git -C ${tempDir} checkout --detach ${targetSha}`]: { stdout: "" },
-      "pnpm --version": { stdout: "10.0.0" },
+      "pnpm --version": { stdout: "8.0.0" },
       "pnpm install": { stdout: "" },
       "pnpm build": { stdout: "" },
       "pnpm ui:build": { stdout: "" },
@@ -1800,7 +1809,7 @@ describe("runGatewayUpdate", () => {
         if (key === "pnpm --version") {
           const envPath = options?.env?.PATH ?? options?.env?.Path ?? "";
           if (envPath.includes("openclaw-update-pnpm-")) {
-            return { stdout: "11.0.0" };
+            return { stdout: "8.0.0" };
           }
           throw new Error("spawn pnpm ENOENT");
         }
@@ -1810,7 +1819,7 @@ describe("runGatewayUpdate", () => {
         if (key === "npm --version") {
           return { stdout: "10.0.0" };
         }
-        if (key.startsWith("npm install --prefix ") && key.endsWith(" pnpm@11")) {
+        if (key.startsWith("npm install --prefix ") && key.endsWith(" pnpm@8.0.0")) {
           return { stdout: "added 1 package" };
         }
         return undefined;
@@ -1844,7 +1853,7 @@ describe("runGatewayUpdate", () => {
           if (pnpmVersionChecks === 1) {
             throw new Error("spawn pnpm ENOENT");
           }
-          return { stdout: "10.0.0" };
+          return { stdout: "8.0.0" };
         }
         if (key === "corepack --version") {
           return { stdout: "0.30.0" };
@@ -1878,7 +1887,7 @@ describe("runGatewayUpdate", () => {
           const envPath = options?.env?.PATH ?? options?.env?.Path ?? "";
           if (envPath.includes("openclaw-update-pnpm-")) {
             pnpmEnvPaths.push(envPath);
-            return { stdout: "11.0.0" };
+            return { stdout: "8.0.0" };
           }
           throw new Error("spawn pnpm ENOENT");
         }
@@ -1888,7 +1897,7 @@ describe("runGatewayUpdate", () => {
         if (key === "npm --version") {
           return { stdout: "10.0.0" };
         }
-        if (key.startsWith("npm install --prefix ") && key.endsWith(" pnpm@11")) {
+        if (key.startsWith("npm install --prefix ") && key.endsWith(" pnpm@8.0.0")) {
           return { stdout: "added 1 package" };
         }
         if (
@@ -2259,6 +2268,9 @@ describe("runGatewayUpdate", () => {
       ) {
         return { stdout: "", stderr: "", code: 0 };
       }
+      if (key === "pnpm --version") {
+        return toCommandResult({ stdout: "8.0.0" });
+      }
       if (key === "pnpm install" || key === "pnpm build" || key === "pnpm lint") {
         return { stdout: "", stderr: "", code: 0 };
       }
@@ -2304,7 +2316,7 @@ describe("runGatewayUpdate", () => {
         if (key === "npm --version") {
           return { stdout: "10.0.0" };
         }
-        if (key.startsWith("npm install --prefix ") && key.endsWith(" pnpm@11")) {
+        if (key.startsWith("npm install --prefix ") && key.endsWith(" pnpm@8.0.0")) {
           return { stderr: "network exploded", code: 1 };
         }
         return undefined;
@@ -2966,13 +2978,14 @@ describe("runGatewayUpdate", () => {
   ])(
     "allows rollback restart only with a $bundle startup bundle",
     async ({ missingRollbackStartupAsset, serviceRestartSafe }) => {
-      await setupGitCheckout({ packageManager: "pnpm@8.0.0" });
+      await setupGitCheckout({ packageManager: "pnpm@11.22.0" });
       const beforeSha = "a".repeat(40);
       const targetSha = "b".repeat(40);
       const stableTag = "v1.0.1-1";
       let currentHead = beforeSha;
       let buildCount = 0;
       const calls: string[] = [];
+      const managerVersions: string[] = [];
       const doctorNodePath = await resolveStableNodePath(process.execPath);
       const doctorCommand = `${doctorNodePath} ${path.join(tempDir, "openclaw.mjs")} doctor --non-interactive --fix`;
       const writeRuntime = async (head: string) => {
@@ -3004,7 +3017,7 @@ describe("runGatewayUpdate", () => {
           ),
         ]);
       };
-      const runCommand = async (argv: string[]) => {
+      const runCommand = async (argv: string[], options?: { cwd?: string }) => {
         const key = argv.join(" ");
         calls.push(key);
         if (key === `git -C ${tempDir} rev-parse --show-toplevel`) {
@@ -3027,6 +3040,10 @@ describe("runGatewayUpdate", () => {
         }
         if (key === `git -C ${tempDir} checkout --detach ${stableTag}`) {
           currentHead = targetSha;
+          await fs.writeFile(
+            path.join(tempDir, "package.json"),
+            JSON.stringify({ name: "openclaw", version: "1.0.1", packageManager: "pnpm@12.0.0" }),
+          );
           return toCommandResult();
         }
         if (key === `git -C ${tempDir} checkout --force main`) {
@@ -3034,7 +3051,17 @@ describe("runGatewayUpdate", () => {
         }
         if (key === `git -C ${tempDir} reset --hard ${beforeSha}`) {
           currentHead = beforeSha;
+          await fs.writeFile(
+            path.join(tempDir, "package.json"),
+            JSON.stringify({ name: "openclaw", version: "1.0.0", packageManager: "pnpm@11.22.0" }),
+          );
           return toCommandResult();
+        }
+        if (key === "pnpm --version") {
+          expect(options?.cwd).toBe(tempDir);
+          const version = currentHead === beforeSha ? "11.22.0" : "12.0.0";
+          managerVersions.push(version);
+          return toCommandResult({ stdout: version });
         }
         if (key === "pnpm install") {
           return toCommandResult();
@@ -3052,6 +3079,7 @@ describe("runGatewayUpdate", () => {
 
       const result = await runWithCommand(runCommand, { channel: "stable" });
 
+      expect(managerVersions).toEqual(["12.0.0", "11.22.0"]);
       expect(result).toMatchObject({
         status: "error",
         reason: "doctor-failed",

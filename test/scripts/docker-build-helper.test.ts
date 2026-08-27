@@ -2982,7 +2982,9 @@ exec "$@"
     const exitPromise = new Promise<{
       code: number | null;
       signal: NodeJS.Signals | null;
-    }>((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+    }>((resolve) => {
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
 
     try {
       for (let attempt = 0; attempt < 500 && !existsSync(markerPath); attempt += 1) {
@@ -4844,7 +4846,10 @@ source "$ROOT_DIR/scripts/lib/docker-e2e-logs.sh"
       "npm install -g /tmp/openclaw-current.tgz",
       "runuser -u appuser -- openclaw --version",
       "runuser -u appuser -- openclaw --help",
-      "corepack prepare pnpm@11.22.0 --activate",
+      'corepack prepare "$1" --activate',
+      "pnpm list --global --json",
+      'test -f "$package_root/package.json"',
+      'test "$PNPM_PACKAGE_VERSION" = "$PACKAGE_VERSION"',
       "pnpm add --global --allow-build=openclaw",
       "bun@1.4.0",
       'test "$(command -v openclaw)" = "/usr/local/bin/openclaw"',

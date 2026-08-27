@@ -154,10 +154,16 @@ For contributors or anyone who wants to run from a local checkout:
 ```bash
 git clone https://github.com/openclaw/openclaw.git
 cd openclaw
+corepack enable
 pnpm install && pnpm build && pnpm ui:build
 pnpm link --global
 openclaw onboard --install-daemon
 ```
+
+Corepack selects the exact pnpm version from `package.json` (currently pnpm 12).
+If Corepack is unavailable, install that version explicitly with
+`npm install -g pnpm@12.0.0 --allow-scripts=pnpm@12.0.0`; keep npm install scripts and optional dependencies
+enabled so pnpm can provision its native executable.
 
 Or skip the link and use `pnpm openclaw ...` from inside the repo. See [Setup](/start/setup) for full development workflows.
 

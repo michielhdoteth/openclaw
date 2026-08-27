@@ -7,16 +7,17 @@ import {
   ensureOpenClawAgentDatabasePermissions,
   isOpenClawAgentDatabaseOpen,
   migrateOpenClawAgentDatabaseForMaintenance,
+  withAgentDatabaseMaintenanceLease,
 } from "../state/openclaw-agent-db.js";
 import { resolveTargetSqlitePath } from "./doctor-session-sqlite-readers.js";
 import type { DoctorSessionSqliteCompactReport } from "./doctor-session-sqlite-types.js";
 import { compactDoctorSqliteFile } from "./doctor-sqlite-compact.js";
 
 /** Reclaim free pages from one agent session SQLite database. */
-export function compactDoctorSessionSqliteTarget(
+export async function compactDoctorSessionSqliteTarget(
   target: SessionStoreTarget,
   options: { env?: NodeJS.ProcessEnv; operation?: "import-finalize" } = {},
-): DoctorSessionSqliteCompactReport {
+): Promise<DoctorSessionSqliteCompactReport> {
   const sqlitePath = resolveTargetSqlitePath(target);
   const beforeFileSizes = readSqliteFileSizes(sqlitePath);
   const stat = readSessionDatabaseStat(sqlitePath);
@@ -48,41 +49,46 @@ export function compactDoctorSessionSqliteTarget(
       );
     }
   };
-  if (options.operation === "import-finalize") {
-    migrateOpenClawAgentDatabaseForMaintenance({
-      agentId: target.agentId,
-      pathname: sqlitePath,
-    });
-    requireQuarantineCleared();
-  }
-
-  const compact = compactDoctorSqliteFile({
-    operation: options.operation,
-    afterSuccess: () => {
-      requireQuarantineCleared();
-      ensureOpenClawAgentDatabasePermissions(sqlitePath, {
-        agentId: target.agentId,
-        path: sqlitePath,
-      });
-    },
-    sqlitePath,
-    validateBeforeMutation: (database) =>
-      assertOpenClawAgentDatabaseForMaintenance(database, {
+  const compactTarget = () => {
+    if (options.operation === "import-finalize") {
+      migrateOpenClawAgentDatabaseForMaintenance({
         agentId: target.agentId,
         pathname: sqlitePath,
-      }),
-  });
-  return {
-    dbSizeAfterBytes: compact.after.dbSizeBytes,
-    dbSizeBeforeBytes: compact.before.dbSizeBytes,
-    freelistAfterPages: compact.after.freelistPages,
-    freelistBeforePages: compact.before.freelistPages,
-    pageSizeBytes: compact.before.pageSizeBytes || compact.after.pageSizeBytes,
-    reclaimedBytes: compact.reclaimedBytes,
-    skipped: false,
-    walSizeAfterBytes: compact.after.walSizeBytes,
-    walSizeBeforeBytes: compact.before.walSizeBytes,
+      });
+      requireQuarantineCleared();
+    }
+
+    const compact = compactDoctorSqliteFile({
+      operation: options.operation,
+      afterSuccess: () => {
+        requireQuarantineCleared();
+        ensureOpenClawAgentDatabasePermissions(sqlitePath, {
+          agentId: target.agentId,
+          path: sqlitePath,
+        });
+      },
+      sqlitePath,
+      validateBeforeMutation: (database) =>
+        assertOpenClawAgentDatabaseForMaintenance(database, {
+          agentId: target.agentId,
+          pathname: sqlitePath,
+        }),
+    });
+    return {
+      dbSizeAfterBytes: compact.after.dbSizeBytes,
+      dbSizeBeforeBytes: compact.before.dbSizeBytes,
+      freelistAfterPages: compact.after.freelistPages,
+      freelistBeforePages: compact.before.freelistPages,
+      pageSizeBytes: compact.before.pageSizeBytes || compact.after.pageSizeBytes,
+      reclaimedBytes: compact.reclaimedBytes,
+      skipped: false,
+      walSizeAfterBytes: compact.after.walSizeBytes,
+      walSizeBeforeBytes: compact.before.walSizeBytes,
+    };
   };
+  return options.operation === "import-finalize"
+    ? withAgentDatabaseMaintenanceLease(options, async () => compactTarget())
+    : compactTarget();
 }
 
 function readSessionDatabaseStat(sqlitePath: string): fs.Stats | undefined {

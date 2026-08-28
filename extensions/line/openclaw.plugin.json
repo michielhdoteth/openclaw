@@ -3,7 +3,6 @@
   "doctorContract": {},
   "name": "LINE",
   "description": "OpenClaw LINE channel plugin for LINE Bot API chats.",
-  "icon": "https://cdn.simpleicons.org/line",
   "activation": {
     "onStartup": false
   },

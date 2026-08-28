@@ -62,7 +62,7 @@ describe("buildGatewayRuntimeHints", () => {
     const hints = buildGatewayRuntimeHints(
       {
         status: "unknown",
-        detail: "service runtime inspection failed; retry with openclaw gateway status --deep",
+        detail: "service runtime inspection failed; retry with openclaw status --deep",
         inspectionFailure: {
           code: "service-runtime-inspection-failed",
           detail: "systemctl --user unavailable: Failed to connect to bus",

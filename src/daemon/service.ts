@@ -3,8 +3,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
-import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
 import { assertGatewayServiceMutationAllowed } from "../infra/gateway-supervision.js";
 import { parseTcpPort, parseTcpPortFromArgs } from "../infra/tcp-port.js";
 import { assertFutureConfigActionAllowed } from "./future-config-guard.js";
@@ -32,7 +30,10 @@ import {
   uninstallScheduledTask,
 } from "./schtasks.js";
 import { mergeGatewayServiceEnv } from "./service-env-merge.js";
-import type { GatewayServiceRuntime } from "./service-runtime.js";
+import {
+  createServiceRuntimeInspectionFailure,
+  type GatewayServiceRuntime,
+} from "./service-runtime.js";
 import type {
   GatewayServiceCommandConfig,
   GatewayServiceControlArgs,
@@ -106,24 +107,6 @@ type ReadGatewayServiceStateArgs = GatewayServiceEnvArgs & {
 const TEMP_PROGRAM_ROOTS = [os.tmpdir(), "/tmp", "/private/tmp", "/var/tmp"].map((entry) =>
   path.resolve(entry),
 );
-const SERVICE_RUNTIME_INSPECTION_ERROR_MAX_CHARS = 500;
-const SERVICE_RUNTIME_INSPECTION_FAILED_DETAIL =
-  "service runtime inspection failed; retry with openclaw gateway status --deep";
-
-function createServiceRuntimeInspectionFailure(error: unknown): GatewayServiceRuntime {
-  const rawDetail = error instanceof Error ? error.message : String(error);
-  return {
-    status: "unknown",
-    detail: SERVICE_RUNTIME_INSPECTION_FAILED_DETAIL,
-    inspectionFailure: {
-      code: "service-runtime-inspection-failed",
-      detail:
-        truncateUtf16Safe(sanitizeForLog(rawDetail), SERVICE_RUNTIME_INSPECTION_ERROR_MAX_CHARS) ||
-        "unknown error",
-    },
-  };
-}
-
 function pathIsSameOrChild(candidate: string, parent: string): boolean {
   return candidate === parent || candidate.startsWith(`${parent}${path.sep}`);
 }

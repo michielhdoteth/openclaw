@@ -112,7 +112,7 @@ describe("readServiceStatusSummary", () => {
         probe === "load"
           ? "systemd unknown (inspection failed: Error: service manager permission denied) · stopped"
           : probe === "runtime"
-            ? "systemd disabled (inspection failed: service runtime inspection failed; retry with openclaw gateway status --deep) · unknown"
+            ? "systemd disabled (inspection failed: service runtime inspection failed; retry with openclaw status --deep) · unknown"
             : "systemd disabled (inspection failed: Error: service manager permission denied) · unknown",
       );
       if (probe === "runtime") {

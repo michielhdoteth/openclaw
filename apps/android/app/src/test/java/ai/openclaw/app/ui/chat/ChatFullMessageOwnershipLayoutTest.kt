@@ -85,6 +85,8 @@ import org.robolectric.config.ConfigurationRegistry
 import java.net.InetAddress
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
@@ -777,12 +779,32 @@ class ChatFullMessageOwnershipLayoutTest {
 
   @Test
   fun disconnectedLivePreviewAsksToReconnectRatherThanUpdateTheGateway() {
+    assertDisconnectedReaderSurvivesFailedReconnect()
+  }
+
+  @Test
+  fun missingMethodCatalogStillRetiresOnReconnectAndDisconnect() {
+    gateway.omitMethodCatalog = true
+    composeRule.runOnIdle { replaceConnectionBeforeRecomposition() }
+    composeRule.waitForIdle()
+    viewAll().performClick()
+    composeRule.onNodeWithText("Update the Gateway to load the full message.").assertIsDisplayed()
+    val catalog = runtime.gatewayCatalogRevision.value
+    composeRule.runOnIdle { replaceConnectionBeforeRecomposition() }
+    composeRule.waitForIdle()
+    assertTrue(runtime.gatewayCatalogRevision.value > catalog)
+    composeRule.onNodeWithText("Close").assertDoesNotExist()
+    assertDisconnectedReaderSurvivesFailedReconnect()
+  }
+
+  private fun assertDisconnectedReaderSurvivesFailedReconnect() {
     val preview = runtime.chatMessages.value.single()
     val catalog = runtime.gatewayCatalogRevision.value
     gateway.disconnectOperatorAndRejectReconnects()
     composeRule.waitUntil(FULL_MESSAGE_READY_TIMEOUT_MS) {
       shadowOf(Looper.getMainLooper()).idle()
-      !model.gatewayConnectionDisplay.value.isConnected &&
+      gateway.rejectedConnections.isNotEmpty() &&
+        !model.gatewayConnectionDisplay.value.isConnected &&
         runtime.gatewayCatalogRevision.value > catalog &&
         model.gatewayCatalogRevision.value == runtime.gatewayCatalogRevision.value &&
         model.chatSelectionGeneration.value == runtime.chatSelectionGeneration.value
@@ -790,6 +812,14 @@ class ChatFullMessageOwnershipLayoutTest {
     assertEquals(preview, runtime.chatMessages.value.single())
     viewAll().assertIsDisplayed().assertIsEnabled()
     viewAll().performClick()
+    composeRule.onNodeWithText("Reconnect to load the full message.").assertIsDisplayed()
+    val attempts = gateway.rejectedConnections.size
+    gateway.releaseRejectedConnection()
+    composeRule.waitUntil(FULL_MESSAGE_READY_TIMEOUT_MS) {
+      shadowOf(Looper.getMainLooper()).idle()
+      gateway.rejectedConnections.size > attempts &&
+        model.gatewayCatalogRevision.value == runtime.gatewayCatalogRevision.value
+    }
     composeRule.onNodeWithText("Reconnect to load the full message.").assertIsDisplayed()
     composeRule.onNodeWithText("Update the Gateway to load the full message.").assertDoesNotExist()
     assertTrue(gateway.fullReads.isEmpty())
@@ -939,16 +969,38 @@ class ChatFullMessageOwnershipLayoutTest {
 
   private fun selectChat(key: String) {
     composeRule.runOnIdle { model.switchChatSession(key, ownerAgentId = "main") }
-    composeRule.waitUntil(FULL_MESSAGE_READY_TIMEOUT_MS) {
-      shadowOf(Looper.getMainLooper()).idle()
-      model.chatSessionKey.value == key &&
-        !model.chatHistoryLoading.value &&
-        model.chatHealthOk.value &&
-        model.chatMessages.value
-          .singleOrNull()
-          ?.content
-          ?.singleOrNull()
-          ?.text == gateway.historyText(key)
+    try {
+      composeRule.waitUntil(FULL_MESSAGE_READY_TIMEOUT_MS) {
+        shadowOf(Looper.getMainLooper()).idle()
+        model.chatSessionKey.value == key &&
+          !model.chatHistoryLoading.value &&
+          model.chatHealthOk.value &&
+          model.chatMessages.value
+            .singleOrNull()
+            ?.content
+            ?.singleOrNull()
+            ?.text == gateway.historyText(key)
+      }
+    } catch (failure: Exception) {
+      throw AssertionError(
+        "Chat readiness for $key: runtime=${runtime.chatSessionKey.value}/${runtime.chatHistoryLoading.value}/${runtime.chatHealthOk.value}; " +
+          "model=${model.chatSessionKey.value}/${model.chatHistoryLoading.value}/${model.chatHealthOk.value}; " +
+          "rows=${runtime.chatMessages.value.size}/${model.chatMessages.value.size}; " +
+          "textMatches=${runtime.chatMessages.value
+            .singleOrNull()
+            ?.content
+            ?.singleOrNull()
+            ?.text == gateway.historyText(key)}/" +
+          "${model.chatMessages.value
+            .singleOrNull()
+            ?.content
+            ?.singleOrNull()
+            ?.text == gateway.historyText(key)}; " +
+          "error=${runtime.chatError.value}/${model.chatError.value}; " +
+          "connected=${runtime.gatewayConnectionDisplay.value.isConnected}; " +
+          "history=${gateway.historyReads.value.takeLast(8)}",
+        failure,
+      )
     }
     composeRule.waitForIdle()
     assertTrue(model.chatHealthOk.value)
@@ -1127,6 +1179,7 @@ internal class FullMessageGateway : AutoCloseable {
   private val operatorSocket = AtomicReference<WebSocket?>()
 
   @Volatile private var rejectConnections = false
+  val rejectedConnections = CopyOnWriteArrayList<CountDownLatch>()
   val operatorConnection = AtomicInteger()
   val fullReads = CopyOnWriteArrayList<FullMessageRead>()
   val historyReads = MutableStateFlow<List<Pair<Int, String>>>(emptyList())
@@ -1147,6 +1200,8 @@ internal class FullMessageGateway : AutoCloseable {
 
   @Volatile var advertiseFullRead = true
 
+  @Volatile var omitMethodCatalog = false
+
   @Volatile var fullReadRpcError = false
   val endpoint: GatewayEndpoint
 
@@ -1155,6 +1210,9 @@ internal class FullMessageGateway : AutoCloseable {
       object : Dispatcher() {
         override fun dispatch(request: RecordedRequest): MockResponse =
           if (rejectConnections) {
+            val release = CountDownLatch(1)
+            rejectedConnections += release
+            check(release.await(FULL_MESSAGE_READY_TIMEOUT_MS, TimeUnit.MILLISECONDS))
             MockResponse().setResponseCode(503)
           } else if (request.getHeader("Upgrade").equals("websocket", ignoreCase = true)) {
             MockResponse().withWebSocketUpgrade(listener(sequence.incrementAndGet()))
@@ -1175,6 +1233,10 @@ internal class FullMessageGateway : AutoCloseable {
   fun disconnectOperatorAndRejectReconnects() {
     rejectConnections = true
     check(checkNotNull(operatorSocket.get()).close(1001, "Proof operator disconnected"))
+  }
+
+  fun releaseRejectedConnection() {
+    rejectedConnections.last().countDown()
   }
 
   fun fullText(session: String) = "$previewPrefix$session\n" + "An ordinary paragraph in a long answer. ".repeat(240) + "\n\n$FULL_MESSAGE_TAIL"
@@ -1241,8 +1303,14 @@ internal class FullMessageGateway : AutoCloseable {
                 operatorConnection.set(connection)
                 operatorSocket.set(webSocket)
               }
+              val methods =
+                if (omitMethodCatalog) {
+                  ""
+                } else {
+                  "\"methods\":[\"chat.history\",${if (advertiseFullRead) "\"chat.message.get\"," else ""}\"chat.metadata\",\"health\",\"sessions.list\"],"
+                }
               json.parseToJsonElement(
-                """{"type":"hello-ok","protocol":3,"server":{"host":"full-message-$connection","version":"proof"},"features":{"methods":["chat.history",${if (advertiseFullRead) "\"chat.message.get\"," else ""}"chat.metadata","health","sessions.list"],"events":[]},"auth":{"role":"$role","scopes":${if (role == "operator") "[\"operator.read\",\"operator.write\"]" else "[]"}},"snapshot":{"sessionDefaults":{"mainSessionKey":"agent:main:main"}}}""",
+                """{"type":"hello-ok","protocol":3,"server":{"host":"full-message-$connection","version":"proof"},"features":{$methods"events":[]},"auth":{"role":"$role","scopes":${if (role == "operator") "[\"operator.read\",\"operator.write\"]" else "[]"}},"snapshot":{"sessionDefaults":{"mainSessionKey":"agent:main:main"}}}""",
               )
             }
             "chat.history" -> {
@@ -1328,6 +1396,7 @@ internal class FullMessageGateway : AutoCloseable {
   }
 
   override fun close() {
+    rejectedConnections.forEach { it.countDown() }
     server.shutdown()
   }
 }

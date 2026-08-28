@@ -32,12 +32,15 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
@@ -170,6 +173,60 @@ class ChatFullMessageCancellationTest {
       }
     }
 
+  @Test
+  fun anOlderSelectionCannotOverwriteReadinessFromANewerRefresh() =
+    runBlocking {
+      withReader { fixture ->
+        val connection = fixture.gateway.operatorConnection.get()
+        val gate = SelectionSetupGate()
+        val selection =
+          async(Dispatchers.IO) {
+            gate.ownerThread.set(Thread.currentThread())
+            fixture.selectionSetupGate.set(gate)
+            fixture.controller.switchSession(FULL_MESSAGE_SECOND_CHAT, ownerAgentId = "main")
+          }
+        try {
+          withTimeout(FULL_MESSAGE_READY_TIMEOUT_MS) { gate.entered.await() }
+          assertEquals(FULL_MESSAGE_SECOND_CHAT, fixture.controller.sessionKey.value)
+          val beforeHistory = fixture.gateway.historyReads.value.size
+          fixture.controller.refresh()
+          fixture.awaitReady(FULL_MESSAGE_SECOND_CHAT)
+          assertTrue(
+            "The newer refresh must complete a real history read on the same socket",
+            fixture.gateway.historyReads.value
+              .drop(beforeHistory)
+              .contains(connection to FULL_MESSAGE_SECOND_CHAT),
+          )
+          assertEquals(connection, fixture.gateway.operatorConnection.get())
+
+          gate.release.countDown()
+          withTimeout(FULL_MESSAGE_READY_TIMEOUT_MS) { selection.await() }
+          assertFalse(
+            "Older selection setup must not restore loading after a newer refresh completed",
+            fixture.controller.historyLoading.value,
+          )
+          assertTrue(
+            "Older selection setup must not clear health after a newer refresh completed",
+            fixture.controller.healthOk.value,
+          )
+          assertEquals(FULL_MESSAGE_SECOND_CHAT, fixture.controller.sessionKey.value)
+          assertEquals(
+            fixture.gateway.preview(FULL_MESSAGE_SECOND_CHAT),
+            fixture.controller.messages.value
+              .single()
+              .content
+              .single()
+              .text,
+          )
+          assertEquals(connection, fixture.gateway.operatorConnection.get())
+        } finally {
+          fixture.selectionSetupGate.compareAndSet(gate, null)
+          gate.release.countDown()
+          selection.cancelAndJoin()
+        }
+      }
+    }
+
   private suspend fun withReader(block: suspend CoroutineScope.(ReaderFixture) -> Unit) =
     coroutineScope {
       val app = RuntimeEnvironment.getApplication()
@@ -180,6 +237,7 @@ class ChatFullMessageCancellationTest {
       val catalogRevision = AtomicLong()
       val cancelDuringValidation = AtomicReference<Job?>()
       val dispatchGate = AtomicReference<RequestGate?>()
+      val selectionSetupGate = AtomicReference<SelectionSetupGate?>()
       val controllerRef = AtomicReference<ChatController?>()
       var session: GatewaySession? = null
       try {
@@ -242,7 +300,23 @@ class ChatFullMessageCancellationTest {
               }
             },
             cacheScope = { ChatCacheScope(gateway.endpoint.stableId, catalogRevision.get()) },
-            gatewayAdvertisesMethod = { method -> hello.value?.methods?.contains(method) },
+            gatewayAdvertisesMethod = { method ->
+              val gate = selectionSetupGate.get()
+              if (
+                method == "progressCard.get" &&
+                gate != null &&
+                gate.ownerThread.get() === Thread.currentThread() &&
+                selectionSetupGate.compareAndSet(gate, null)
+              ) {
+                // Pause only this selection's synchronous catalog read, outside owner locks;
+                // a newer refresh must remain free to complete through the real socket.
+                gate.entered.complete(Unit)
+                check(gate.release.await(FULL_MESSAGE_READY_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                  "Selection setup gate was not released"
+                }
+              }
+              hello.value?.methods?.contains(method)
+            },
             currentGatewayCatalogRevision = {
               // Model cancellation while the owner check holds its monitor, after execute's
               // initial cancellation check. The catalog value itself remains the real hello fact.
@@ -252,7 +326,7 @@ class ChatFullMessageCancellationTest {
           )
         controllerRef.set(controller)
         controller.switchSession(FULL_MESSAGE_FIRST_CHAT, ownerAgentId = "main")
-        val fixture = ReaderFixture(gateway, liveSession, controller, hello, catalogRevision, cancelDuringValidation, dispatchGate)
+        val fixture = ReaderFixture(gateway, liveSession, controller, hello, catalogRevision, cancelDuringValidation, dispatchGate, selectionSetupGate)
         fixture.awaitReady()
         block(fixture)
       } finally {
@@ -273,6 +347,12 @@ class ChatFullMessageCancellationTest {
     val release = CompletableDeferred<Unit>()
   }
 
+  private class SelectionSetupGate {
+    val ownerThread = AtomicReference<Thread?>()
+    val entered = CompletableDeferred<Unit>()
+    val release = CountDownLatch(1)
+  }
+
   private data class ReaderFixture(
     val gateway: FullMessageGateway,
     val session: GatewaySession,
@@ -281,6 +361,7 @@ class ChatFullMessageCancellationTest {
     val catalogRevision: AtomicLong,
     val cancelDuringValidation: AtomicReference<Job?>,
     val dispatchGate: AtomicReference<RequestGate?>,
+    val selectionSetupGate: AtomicReference<SelectionSetupGate?>,
   ) {
     fun prepare(sessionKey: String = FULL_MESSAGE_FIRST_CHAT) =
       checkNotNull(

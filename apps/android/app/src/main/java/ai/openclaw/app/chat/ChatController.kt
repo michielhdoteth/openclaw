@@ -2515,7 +2515,8 @@ class ChatController internal constructor(
     markLoading: Boolean = true,
   ): Long {
     val owner = normalizeSessionSelectionOwner(key, ownerAgentId)
-    // Selection and canonical rows share the full-reader publication boundary, including IO callers.
+    // Commit selection and its reset together: a newer IO refresh must not finish
+    // between publishing this generation and clearing its readiness or run state.
     val (generation, selectionChanged) =
       synchronized(gatewayScopeApplyLock) {
         val generation = historyLoadGeneration.incrementAndGet()
@@ -2527,47 +2528,45 @@ class ChatController internal constructor(
           _messages.value = emptyList()
           _messagesFromCache.value = false
         }
+        if (changed) {
+          resetSwarmProgress(key)
+          sessionBranchesRefreshGeneration.incrementAndGet()
+          sessionBranchSwitchGeneration.incrementAndGet()
+          sessionBranchSwitchClaimed.set(false)
+          _sessionBranches.value = emptyList()
+          _sessionBranchesLoading.value = false
+          _sessionBranchSwitching.value = false
+          clearSubagentActivities()
+          clearProgressCard()
+        }
+        _sessions.value =
+          reconcileGlobalObserverDigestOwner(
+            _sessions.value,
+            activeAgentId = owner ?: resolveAgentIdForSessionKey(key),
+            adoptOwnerless = false,
+          )
+        applyThinkingMetadata(_sessions.value.firstOrNull { it.key == key })
+        _selectedModelRef.value = null
+        lastHandledTerminalRunId = null
+        val nextAgentId = resolveAgentIdForSessionKey(key)
+        if (chatMetadataAgentId != nextAgentId) {
+          _commands.value = emptyList()
+          _modelCatalog.value = emptyList()
+          chatMetadataAgentId = null
+          chatMetadataLoadState = ChatMetadataLoadState.Unloaded
+          disableSwarmProgress(key)
+        }
+        updateErrorText(null)
+        _healthOk.value = false
+        clearLiveHistoryMarker()
+        clearPendingRuns()
+        clearLiveRunUi()
+        _sessionId.value = null
+        _historyLoading.value = markLoading
+        restorePendingRunProjectionsForCurrentOwner()
         generation to changed
       }
-    if (selectionChanged) {
-      resetSwarmProgress(key)
-      sessionBranchesRefreshGeneration.incrementAndGet()
-      sessionBranchSwitchGeneration.incrementAndGet()
-      sessionBranchSwitchClaimed.set(false)
-      _sessionBranches.value = emptyList()
-      _sessionBranchesLoading.value = false
-      _sessionBranchSwitching.value = false
-      clearSubagentActivities()
-    }
-    if (selectionChanged) {
-      clearProgressCard()
-      refreshProgressCard()
-    }
-    _sessions.value =
-      reconcileGlobalObserverDigestOwner(
-        _sessions.value,
-        activeAgentId = owner ?: resolveAgentIdForSessionKey(key),
-        adoptOwnerless = false,
-      )
-    applyThinkingMetadata(_sessions.value.firstOrNull { it.key == key })
-    _selectedModelRef.value = null
-    lastHandledTerminalRunId = null
-    val nextAgentId = resolveAgentIdForSessionKey(key)
-    if (chatMetadataAgentId != nextAgentId) {
-      _commands.value = emptyList()
-      _modelCatalog.value = emptyList()
-      chatMetadataAgentId = null
-      chatMetadataLoadState = ChatMetadataLoadState.Unloaded
-      disableSwarmProgress(key)
-    }
-    updateErrorText(null)
-    _healthOk.value = false
-    clearLiveHistoryMarker()
-    clearPendingRuns()
-    clearLiveRunUi()
-    _sessionId.value = null
-    _historyLoading.value = markLoading
-    restorePendingRunProjectionsForCurrentOwner()
+    if (selectionChanged) refreshProgressCard()
     return generation
   }
 
@@ -3892,6 +3891,7 @@ class ChatController internal constructor(
         val key = normalizeRequestedSessionKey(_sessionKey.value)
         val generation = historyLoadGeneration.incrementAndGet()
         _sessionKey.value = key
+        _historyLoading.value = true
         if (completesReconnectRecovery) reconnectRecoveryGeneration = generation
         key to generation
       }
@@ -3908,7 +3908,6 @@ class ChatController internal constructor(
       synchronized(pendingRuns) {
         pendingRuns + optimisticMessagesByRunId.keys + unresolvedRepliesByRunId.keys
       }
-    _historyLoading.value = true
     scope.launch {
       bootstrap(
         sessionKey = key,

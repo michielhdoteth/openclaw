@@ -1335,6 +1335,7 @@ class NodeRuntime private constructor(
   private val gatewayMethodsLock = Any()
   private var gatewayApprovalRpcFamily = GatewayApprovalRpcFamily.Unavailable
   private var gatewayAdvertisedMethods: Set<String>? = null
+  private var gatewayMethodCatalogPresent = false
   private var gatewayAdvertisedCapabilities: Set<String>? = null
   private val gatewayMethodsEpoch = MutableStateFlow(0L)
   internal val gatewayCatalogRevision: StateFlow<Long> = gatewayMethodsEpoch.asStateFlow()
@@ -1689,7 +1690,7 @@ class NodeRuntime private constructor(
     _remoteAddress.value = null
     _gatewayVersion.value = null
     _gatewayUpdateAvailable.value = null
-    replaceGatewayMethods(null)
+    replaceGatewayMethods(null, present = false)
     replaceGatewayCapabilities(null)
     _operatorScopes.value = emptyList()
     _devicePairingCapabilities.value = GatewayDevicePairingCapabilities()
@@ -7524,8 +7525,15 @@ class NodeRuntime private constructor(
       ?: error("Malformed approval.get response")
   }
 
-  private fun replaceGatewayMethods(methods: Set<String>?) {
+  private fun replaceGatewayMethods(
+    methods: Set<String>?,
+    present: Boolean = true,
+  ) {
     synchronized(gatewayMethodsLock) {
+      // A hello may omit methods, so null alone does not mean disconnected. Retire
+      // each live catalog once; repeated failed reconnects must not dismiss offline UI.
+      if (!present && !gatewayMethodCatalogPresent) return
+      gatewayMethodCatalogPresent = present
       val advertisedMethods = methods.orEmpty()
       gatewayAdvertisedMethods = methods
       gatewayApprovalRpcFamily = selectGatewayApprovalRpcFamily(advertisedMethods)

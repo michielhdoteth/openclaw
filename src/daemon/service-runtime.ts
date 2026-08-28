@@ -46,10 +46,9 @@ export type GatewayServiceRuntime = {
 };
 
 const SERVICE_RUNTIME_INSPECTION_ERROR_MAX_CHARS = 500;
-const SERVICE_RUNTIME_INSPECTION_FAILED_DETAIL =
-  "service runtime inspection failed; retry with openclaw status --deep";
+const SERVICE_RUNTIME_INSPECTION_FAILED_DETAIL = "service runtime inspection failed";
 
-/** Keeps native probe failures diagnostic-only while giving every service one valid recovery path. */
+/** Keeps native probe failures bounded and diagnostic-only for status presentation owners. */
 export function createServiceRuntimeInspectionFailure(error: unknown): GatewayServiceRuntime {
   const rawDetail = error instanceof Error ? error.message : String(error);
   return {

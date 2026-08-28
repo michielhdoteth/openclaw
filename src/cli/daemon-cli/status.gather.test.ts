@@ -833,7 +833,7 @@ describe("gatherDaemonStatus", () => {
     expect((status.service.runtime as { detail?: string }).detail).toBe("19001");
   });
 
-  it("bounds all service-manager reads and still emits JSON after they time out", async () => {
+  it("renders Gateway-specific recovery in text and JSON after service reads time out", async () => {
     serviceIsLoaded.mockImplementationOnce(async (args?: { timeoutMs?: number }) => {
       if (args?.timeoutMs === undefined) {
         return await new Promise<boolean>(() => {});
@@ -865,7 +865,7 @@ describe("gatherDaemonStatus", () => {
     expect(status.service.loaded).toBeNull();
     expect(status.service.runtime).toEqual({
       status: "unknown",
-      detail: "service runtime inspection failed; retry with openclaw status --deep",
+      detail: "service runtime inspection failed; retry with openclaw gateway status --deep",
       inspectionFailure: {
         code: "service-runtime-inspection-failed",
         detail: "錯誤: 系統找不到指定的檔案。",
@@ -889,7 +889,7 @@ describe("gatherDaemonStatus", () => {
           },
           runtime: {
             status: "unknown",
-            detail: "service runtime inspection failed; retry with openclaw status --deep",
+            detail: "service runtime inspection failed; retry with openclaw gateway status --deep",
             inspectionFailure: {
               code: "service-runtime-inspection-failed",
               detail: "錯誤: 系統找不到指定的檔案。",
@@ -909,7 +909,7 @@ describe("gatherDaemonStatus", () => {
       expect(output).toContain("Service: LaunchAgent (unknown)");
       expect(output).not.toContain("Service: LaunchAgent (not loaded)");
       expect(output).toContain(
-        "Runtime: unknown (service runtime inspection failed; retry with openclaw status --deep)",
+        "Runtime: unknown (service runtime inspection failed; retry with openclaw gateway status --deep)",
       );
       expect(output).not.toContain("系統找不到指定的檔案");
     } finally {

@@ -226,7 +226,7 @@ describe("readGatewayServiceState", () => {
     expect(state.running).toBe(false);
     expect(state.runtime).toEqual({
       status: "unknown",
-      detail: "service runtime inspection failed; retry with openclaw status --deep",
+      detail: "service runtime inspection failed",
       inspectionFailure: {
         code: "service-runtime-inspection-failed",
         detail: "錯誤: 系統找不到指定的檔案。",

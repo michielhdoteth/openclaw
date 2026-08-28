@@ -518,7 +518,7 @@ describe("Windows startup fallback", () => {
 
       await expect(readScheduledTaskRuntime(env)).resolves.toEqual({
         status: "unknown",
-        detail: "service runtime inspection failed; retry with openclaw status --deep",
+        detail: "service runtime inspection failed",
         inspectionFailure: {
           code: "service-runtime-inspection-failed",
           detail: "schtasks unavailable: 错误: 拒绝访问。",
@@ -527,7 +527,7 @@ describe("Windows startup fallback", () => {
     });
   });
 
-  it("normalizes unexpected scheduled-task failures through Gateway status", async () => {
+  it("normalizes unexpected scheduled-task failures through the shared status summary", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       const detail = "Zugriff verweigert";
       schtasksResponses.push(
@@ -548,7 +548,7 @@ describe("Windows startup fallback", () => {
 
       expect(summary.runtime).toEqual({
         status: "unknown",
-        detail: "service runtime inspection failed; retry with openclaw status --deep",
+        detail: "service runtime inspection failed",
         inspectionFailure: {
           code: "service-runtime-inspection-failed",
           detail,
@@ -556,7 +556,7 @@ describe("Windows startup fallback", () => {
         missingUnit: false,
       });
       expect(formatStatusServiceValue(summary)).toBe(
-        "Scheduled Task missing (inspection failed: service runtime inspection failed; retry with openclaw status --deep) · unknown",
+        "Scheduled Task missing (inspection failed: service runtime inspection failed) · unknown",
       );
       expect(formatStatusServiceValue(summary)).not.toContain(detail);
     });

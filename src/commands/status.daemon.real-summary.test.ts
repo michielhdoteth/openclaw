@@ -13,7 +13,7 @@ vi.mock("../daemon/node-service.js", () => ({
 
 const { getNodeDaemonStatusSummary } = await import("./status.daemon.js");
 
-it("keeps rejected node runtime recovery guidance service-neutral", async () => {
+it("renders root-status recovery guidance for a rejected node runtime", async () => {
   mocks.resolveNodeService.mockReturnValue(
     createMockGatewayService({
       label: "systemd user",

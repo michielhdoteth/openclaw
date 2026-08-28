@@ -29,10 +29,33 @@ data class ChatMessage(
   val idempotencyKey: String? = null,
   /** Canonical transcript-tree identity supplied by chat.history. */
   val entryId: String? = null,
+  val truncated: Boolean = false,
   val provenance: ChatMessageProvenance? = null,
   val transcriptMarker: ChatTranscriptMarker? = null,
   val senderLabel: String? = null,
 )
+
+internal sealed interface ChatFullMessageState {
+  data object Loading : ChatFullMessageState
+
+  data class Loaded(
+    val content: List<ChatMessageContent>,
+  ) : ChatFullMessageState
+
+  data class Unavailable(
+    val reason: ChatFullMessageUnavailable,
+  ) : ChatFullMessageState
+
+  data object Failed : ChatFullMessageState
+}
+
+internal enum class ChatFullMessageUnavailable {
+  GatewayUpdate,
+  Disconnected,
+  NotFound,
+  TooLarge,
+  Unreadable,
+}
 
 data class ChatMessageProvenance(
   val kind: String,

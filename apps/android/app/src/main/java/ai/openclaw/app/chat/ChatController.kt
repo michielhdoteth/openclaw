@@ -29,10 +29,14 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -115,9 +119,11 @@ class ChatController internal constructor(
     { _, method, paramsJson -> requestGateway(method, paramsJson) },
   private val gatewayAdvertisesMethod: (method: String) -> Boolean? = { null },
   private val gatewayAdvertisesCapability: (capability: String) -> Boolean? = { null },
-  private val captureSettingsRequestLease: (gatewayScope: ChatCacheScope?) -> GatewaySession.RequestLease? =
+  private val currentGatewayCatalogRevision: () -> Long = { 0L },
+  private val captureRequestLease: (gatewayScope: ChatCacheScope?) -> GatewaySession.RequestLease? =
     { gatewayScope ->
-      GatewaySession.RequestLease(endpointStableId = gatewayScope?.gatewayId.orEmpty()) { method, paramsJson, _ ->
+      GatewaySession.RequestLease(endpointStableId = gatewayScope?.gatewayId.orEmpty()) { method, paramsJson, _, withEnqueue ->
+        withEnqueue {}
         if (gatewayScope == null) {
           requestGateway(method, paramsJson)
         } else {
@@ -159,6 +165,7 @@ class ChatController internal constructor(
     currentDefaultAgentRevision: () -> Long = { 0L },
     gatewayAdvertisesMethod: (method: String) -> Boolean? = { null },
     gatewayAdvertisesCapability: (capability: String) -> Boolean? = { null },
+    currentGatewayCatalogRevision: () -> Long = { 0L },
     commandOutbox: ChatCommandOutbox? = null,
     recordModelRecent: (String) -> Unit = {},
     onSessionDeleted: (ChatSessionDeletion) -> Unit = {},
@@ -176,7 +183,8 @@ class ChatController internal constructor(
     },
     gatewayAdvertisesMethod = gatewayAdvertisesMethod,
     gatewayAdvertisesCapability = gatewayAdvertisesCapability,
-    captureSettingsRequestLease = { gatewayScope ->
+    currentGatewayCatalogRevision = currentGatewayCatalogRevision,
+    captureRequestLease = { gatewayScope ->
       session.captureRequestLease(gatewayScope?.gatewayId)
     },
     transcriptCache = transcriptCache,
@@ -592,7 +600,8 @@ class ChatController internal constructor(
 
   // Advances when the visible session changes. Sends use it to detect A -> B -> A switches
   // across durable outbox suspension points; same-owner history reloads keep their projection.
-  private val chatSelectionGeneration = AtomicLong(0)
+  private val chatSelectionGeneration = MutableStateFlow(0L)
+  internal val selectionGeneration: StateFlow<Long> = chatSelectionGeneration.asStateFlow()
   private val historyRequestSequence = AtomicLong(0)
   private val modelSelectionGeneration = AtomicLong(0)
   private val sessionsRequestSequence = AtomicLong(0)
@@ -1278,7 +1287,7 @@ class ChatController internal constructor(
     }
   }
 
-  private data class SessionActionSnapshot(
+  internal data class SessionActionSnapshot(
     val gatewayScope: ChatCacheScope?,
     val sessionKey: String,
     val ownerAgentId: String,
@@ -1532,7 +1541,7 @@ class ChatController internal constructor(
       gatewayScope = currentCacheScope(),
       sessionKey = key,
       ownerAgentId = owner,
-      selectionGeneration = chatSelectionGeneration.get(),
+      selectionGeneration = chatSelectionGeneration.value,
     )
   }
 
@@ -1540,7 +1549,138 @@ class ChatController internal constructor(
     snapshot.gatewayScope == currentCacheScope() &&
       snapshot.sessionKey == _sessionKey.value &&
       snapshot.ownerAgentId == resolveAgentIdForSessionKey(_sessionKey.value)?.trim()?.lowercase() &&
-      snapshot.selectionGeneration == chatSelectionGeneration.get()
+      snapshot.selectionGeneration == chatSelectionGeneration.value
+
+  internal fun prepareFullMessageRead(
+    owner: ChatComposerOwner,
+    selectionGeneration: Long,
+    catalogRevision: Long,
+    message: ChatMessage,
+  ): FullMessageRead? {
+    val snapshot =
+      synchronized(gatewayScopeApplyLock) {
+        currentSessionActionSnapshot(owner.sessionKey)?.takeIf {
+          it.selectionGeneration == selectionGeneration &&
+            isCurrentFullMessage(it, owner, catalogRevision, message)
+        }
+      } ?: return null
+    // Capture outside the logical lock: hello publishes physical -> logical -> catalog.
+    val lease = captureRequestLease(snapshot.gatewayScope)
+    return synchronized(gatewayScopeApplyLock) {
+      if (!isCurrentFullMessage(snapshot, owner, catalogRevision, message)) return@synchronized null
+      val unavailable =
+        when {
+          lease == null -> ChatFullMessageUnavailable.Disconnected
+          gatewayAdvertisesMethod("chat.message.get") != true -> ChatFullMessageUnavailable.GatewayUpdate
+          else -> null
+        }
+      FullMessageRead(snapshot, owner, catalogRevision, message, lease, unavailable)
+    }
+  }
+
+  private fun isCurrentFullMessage(
+    snapshot: SessionActionSnapshot,
+    owner: ChatComposerOwner,
+    catalogRevision: Long,
+    message: ChatMessage,
+  ): Boolean =
+    isCurrentSessionAction(snapshot) &&
+      isCurrentComposerOwner(owner) &&
+      catalogRevision == currentGatewayCatalogRevision() &&
+      message.role == "assistant" &&
+      message.truncated &&
+      !message.entryId.isNullOrBlank() &&
+      _messages.value.any {
+        it.entryId == message.entryId &&
+          it.role == message.role &&
+          it.content == message.content &&
+          it.truncated == message.truncated
+      }
+
+  /** The admitted read owns its outcome; nothing is published through a retained UI callback. */
+  internal inner class FullMessageRead internal constructor(
+    private val snapshot: SessionActionSnapshot,
+    private val owner: ChatComposerOwner,
+    private val catalogRevision: Long,
+    private val message: ChatMessage,
+    private val lease: GatewaySession.RequestLease?,
+    unavailable: ChatFullMessageUnavailable?,
+  ) {
+    private val result = MutableStateFlow<ChatFullMessageState>(unavailable?.let(ChatFullMessageState::Unavailable) ?: ChatFullMessageState.Loading)
+    val state: StateFlow<ChatFullMessageState> = result.asStateFlow()
+
+    suspend fun execute() {
+      val capturedLease = lease ?: return
+      if (result.value != ChatFullMessageState.Loading) return
+      val caller = currentCoroutineContext()
+      caller.ensureActive()
+      val params =
+        buildJsonObject {
+          put("sessionKey", JsonPrimitive(snapshot.sessionKey))
+          put("agentId", JsonPrimitive(snapshot.ownerAgentId))
+          put("messageId", JsonPrimitive(message.entryId))
+        }.toString()
+      val next =
+        try {
+          val response =
+            capturedLease.request("chat.message.get", params) { enqueue ->
+              // Selection retirement and dispatch are one decision, after any transport wait.
+              synchronized(gatewayScopeApplyLock) {
+                if (!isCurrentFullMessage(snapshot, owner, catalogRevision, message)) {
+                  throw GatewayRequestNotEnqueued("full message read retired")
+                }
+                caller.ensureActive()
+                enqueue()
+              }
+            }
+          parseFullMessage(response, message.entryId)
+        } catch (err: CancellationException) {
+          throw err
+        } catch (_: Throwable) {
+          ChatFullMessageState.Failed
+        }
+      capturedLease.commitIfCurrent {
+        synchronized(gatewayScopeApplyLock) {
+          if (caller.isActive && isCurrentFullMessage(snapshot, owner, catalogRevision, message)) {
+            result.value = next
+          }
+        }
+      }
+    }
+  }
+
+  private fun parseFullMessage(
+    payload: String,
+    entryId: String?,
+  ): ChatFullMessageState {
+    val root =
+      runCatching { json.parseToJsonElement(payload).asObjectOrNull() }.getOrNull()
+        ?: return ChatFullMessageState.Unavailable(ChatFullMessageUnavailable.Unreadable)
+    if (root["ok"] == JsonPrimitive(false)) {
+      val reason =
+        when (root["unavailableReason"].asJsonStringOrNull()) {
+          "not_found", "not_visible" -> ChatFullMessageUnavailable.NotFound
+          "oversized" -> ChatFullMessageUnavailable.TooLarge
+          else -> ChatFullMessageUnavailable.Unreadable
+        }
+      return ChatFullMessageState.Unavailable(reason)
+    }
+    val obj = root["message"].asObjectOrNull()
+    if (root["ok"] != JsonPrimitive(true) ||
+      obj == null ||
+      obj["role"].asJsonStringOrNull() != "assistant" ||
+      obj["__openclaw"].asObjectOrNull()?.get("id").asJsonStringOrNull() != entryId
+    ) {
+      return ChatFullMessageState.Unavailable(ChatFullMessageUnavailable.Unreadable)
+    }
+    val parsed = parseMessage(obj) ?: return ChatFullMessageState.Unavailable(ChatFullMessageUnavailable.Unreadable)
+    // The canonical get projection is bounded too; ok:true does not promise complete text.
+    if (parsed.truncated) return ChatFullMessageState.Unavailable(ChatFullMessageUnavailable.TooLarge)
+    if (parsed.content.none { it.type == "text" && !it.text.isNullOrBlank() }) {
+      return ChatFullMessageState.Unavailable(ChatFullMessageUnavailable.Unreadable)
+    }
+    return ChatFullMessageState.Loaded(parsed.content)
+  }
 
   private fun isCurrentBranchSwitch(
     snapshot: SessionActionSnapshot,
@@ -2241,7 +2381,7 @@ class ChatController internal constructor(
   private fun enqueueSessionSettingsMutation(settingsKey: SessionSettingsKey): QueuedSessionSettingsMutation {
     // Capture the physical socket before waiting. A reconnect may retire this
     // lease, but queued work can never resolve the replacement connection.
-    val requestLease = captureSettingsRequestLease(settingsKey.gatewayScope)
+    val requestLease = captureRequestLease(settingsKey.gatewayScope)
     val pending = CompletableDeferred<Boolean>()
     return synchronized(gatewayScopeApplyLock) {
       val previous = pendingSettingsMutations.put(settingsKey, pending)
@@ -2374,11 +2514,22 @@ class ChatController internal constructor(
     clearMessages: Boolean,
     markLoading: Boolean = true,
   ): Long {
-    val generation = historyLoadGeneration.incrementAndGet()
     val owner = normalizeSessionSelectionOwner(key, ownerAgentId)
-    val selectionChanged = _sessionKey.value != key || _sessionOwnerAgentId.value != owner
+    // Selection and canonical rows share the full-reader publication boundary, including IO callers.
+    val (generation, selectionChanged) =
+      synchronized(gatewayScopeApplyLock) {
+        val generation = historyLoadGeneration.incrementAndGet()
+        val changed = _sessionKey.value != key || _sessionOwnerAgentId.value != owner
+        if (changed) chatSelectionGeneration.update { it + 1 }
+        _sessionKey.value = key
+        _sessionOwnerAgentId.value = owner
+        if (clearMessages) {
+          _messages.value = emptyList()
+          _messagesFromCache.value = false
+        }
+        generation to changed
+      }
     if (selectionChanged) {
-      chatSelectionGeneration.incrementAndGet()
       resetSwarmProgress(key)
       sessionBranchesRefreshGeneration.incrementAndGet()
       sessionBranchSwitchGeneration.incrementAndGet()
@@ -2388,8 +2539,6 @@ class ChatController internal constructor(
       _sessionBranchSwitching.value = false
       clearSubagentActivities()
     }
-    _sessionKey.value = key
-    _sessionOwnerAgentId.value = owner
     if (selectionChanged) {
       clearProgressCard()
       refreshProgressCard()
@@ -2418,10 +2567,6 @@ class ChatController internal constructor(
     clearLiveRunUi()
     _sessionId.value = null
     _historyLoading.value = markLoading
-    if (clearMessages) {
-      _messages.value = emptyList()
-      _messagesFromCache.value = false
-    }
     restorePendingRunProjectionsForCurrentOwner()
     return generation
   }
@@ -2503,7 +2648,7 @@ class ChatController internal constructor(
 
   internal suspend fun wasOutboxCommandAdmitted(id: String): Boolean = commandOutbox?.wasAdmitted(id) == true
 
-  internal fun canSendForOwner(expectedOwner: ChatComposerOwner): Boolean {
+  internal fun isCurrentComposerOwner(expectedOwner: ChatComposerOwner): Boolean {
     val cacheScope = currentCacheScope()
     val effectiveSessionKey = normalizeRequestedSessionKey(_sessionKey.value)
     if (effectiveSessionKey == "main" && _sessionOwnerAgentId.value == null) return false
@@ -2526,14 +2671,14 @@ class ChatController internal constructor(
   ): Boolean {
     val sendCacheScope = currentCacheScope()
     val sendGatewayId = sendCacheScope?.gatewayId
-    val sendSelectionGeneration = chatSelectionGeneration.get()
+    val sendSelectionGeneration = chatSelectionGeneration.value
     val trimmed = message.trim()
     if (trimmed.isEmpty() && attachments.isEmpty()) return false
     val sessionKey = _sessionKey.value
     val effectiveSessionKey = normalizeRequestedSessionKey(sessionKey)
     // Owner-aware UI sends must wait for Android's device-scoped main key. The legacy `main`
     // alias is resolved by the gateway's mutable default agent and cannot be routed immutably.
-    if (expectedOwner != null && !canSendForOwner(expectedOwner)) return false
+    if (expectedOwner != null && !isCurrentComposerOwner(expectedOwner)) return false
     val routingOwner =
       resolveChatComposerRoutingOwner(
         gatewayStableId = sendCacheScope?.gatewayId,
@@ -2550,7 +2695,7 @@ class ChatController internal constructor(
     fun isCapturedOwnerCurrent(): Boolean = capturedOwner.matches(currentCacheScope(), _sessionKey.value)
 
     fun ownsCapturedUi(): Boolean =
-      chatSelectionGeneration.get() == sendSelectionGeneration &&
+      chatSelectionGeneration.value == sendSelectionGeneration &&
         (!tracksDefaultAgent || currentDefaultAgentRevision() == sendDefaultAgentRevision) &&
         isCapturedOwnerCurrent()
 
@@ -2993,8 +3138,10 @@ class ChatController internal constructor(
 
     optimisticMessagesByRunId[runId] = optimisticMessage
     unresolvedRepliesByRunId[runId] = optimisticMessage
-    if (_messages.value.none { it.idempotencyKey == optimisticMessage.idempotencyKey }) {
-      _messages.value = _messages.value + optimisticMessage
+    synchronized(gatewayScopeApplyLock) {
+      if (_messages.value.none { it.idempotencyKey == optimisticMessage.idempotencyKey }) {
+        _messages.value = _messages.value + optimisticMessage
+      }
     }
     armPendingRunTimeout(runId)
     synchronized(pendingRuns) { pendingRuns.add(runId) }
@@ -3740,13 +3887,14 @@ class ChatController internal constructor(
     forceHealth: Boolean = false,
     completesReconnectRecovery: Boolean = false,
   ) {
-    val key = normalizeRequestedSessionKey(_sessionKey.value)
-    val generation = historyLoadGeneration.incrementAndGet()
-    if (completesReconnectRecovery) {
+    val (key, generation) =
       synchronized(gatewayScopeApplyLock) {
-        reconnectRecoveryGeneration = generation
+        val key = normalizeRequestedSessionKey(_sessionKey.value)
+        val generation = historyLoadGeneration.incrementAndGet()
+        _sessionKey.value = key
+        if (completesReconnectRecovery) reconnectRecoveryGeneration = generation
+        key to generation
       }
-    }
     val restoredRunIds =
       synchronized(pendingRuns) {
         val restored = disconnectedPendingRunIds.toSet()
@@ -3760,7 +3908,6 @@ class ChatController internal constructor(
       synchronized(pendingRuns) {
         pendingRuns + optimisticMessagesByRunId.keys + unresolvedRepliesByRunId.keys
       }
-    _sessionKey.value = key
     _historyLoading.value = true
     scope.launch {
       bootstrap(
@@ -6367,7 +6514,9 @@ class ChatController internal constructor(
 
   private fun removeOptimisticMessage(runId: String) {
     val message = optimisticMessagesByRunId.remove(runId) ?: return
-    _messages.value = _messages.value.filterNot { it.id == message.id }
+    synchronized(gatewayScopeApplyLock) {
+      _messages.value = _messages.value.filterNot { it.id == message.id }
+    }
   }
 
   private fun transferRunOwnership(
@@ -6392,7 +6541,9 @@ class ChatController internal constructor(
     if (optimistic != null) optimisticMessagesByRunId[newRunId] = rekeyed
     if (unresolved != null) unresolvedRepliesByRunId[newRunId] = rekeyed
     if (terminalWithoutReply) terminalWithoutReplyRunIds.add(newRunId)
-    _messages.value = _messages.value.map { if (it.id == original.id) rekeyed else it }
+    synchronized(gatewayScopeApplyLock) {
+      _messages.value = _messages.value.map { if (it.id == original.id) rekeyed else it }
+    }
     val wasProjected = optimistic != null || unresolved != null || wasPending
     synchronized(pendingRuns) {
       disconnectedPendingRunIds.remove(oldRunId)
@@ -6568,24 +6719,7 @@ class ChatController internal constructor(
     val sessionInfo = root["sessionInfo"].asObjectOrNull()?.let { parseSessionEntry(it, fallbackKey = sessionKey) }
     val array = root["messages"].asArrayOrNull() ?: JsonArray(emptyList())
 
-    val messages =
-      array.mapNotNull { item ->
-        val obj = item.asObjectOrNull() ?: return@mapNotNull null
-        val role = normalizeVisibleChatMessageRole(obj["role"].asStringOrNull()) ?: return@mapNotNull null
-        val content = parseChatMessageContents(obj)
-        val ts = obj["timestamp"].asLongOrNull()
-        ChatMessage(
-          id = UUID.randomUUID().toString(),
-          role = role,
-          content = content,
-          timestampMs = ts,
-          idempotencyKey = obj["idempotencyKey"].asStringOrNull(),
-          entryId = obj["__openclaw"].asObjectOrNull()?.get("id").asStringOrNull(),
-          provenance = parseChatMessageProvenance(obj["provenance"]),
-          transcriptMarker = parseChatTranscriptMarker(obj["__openclaw"]),
-          senderLabel = obj["senderLabel"].asJsonStringOrNull()?.trim()?.takeIf { role == "user" && it.isNotEmpty() },
-        )
-      }
+    val messages = array.mapNotNull { it.asObjectOrNull()?.let(::parseMessage) }
 
     return ChatHistory(
       sessionKey = sessionKey,
@@ -6594,6 +6728,23 @@ class ChatController internal constructor(
       messages = reconcileMessageIds(previous = previousMessages, incoming = messages),
       sessionInfo = sessionInfo,
       inFlightRun = parseInFlightRun(root),
+    )
+  }
+
+  private fun parseMessage(obj: JsonObject): ChatMessage? {
+    val role = normalizeVisibleChatMessageRole(obj["role"].asStringOrNull()) ?: return null
+    val metadata = obj["__openclaw"].asObjectOrNull()
+    return ChatMessage(
+      id = UUID.randomUUID().toString(),
+      role = role,
+      content = parseChatMessageContents(obj),
+      timestampMs = obj["timestamp"].asLongOrNull(),
+      idempotencyKey = obj["idempotencyKey"].asStringOrNull(),
+      entryId = metadata?.get("id").asJsonStringOrNull(),
+      truncated = metadata?.get("truncated") == JsonPrimitive(true),
+      provenance = parseChatMessageProvenance(obj["provenance"]),
+      transcriptMarker = parseChatTranscriptMarker(obj["__openclaw"]),
+      senderLabel = obj["senderLabel"].asJsonStringOrNull()?.trim()?.takeIf { role == "user" && it.isNotEmpty() },
     )
   }
 

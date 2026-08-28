@@ -108,7 +108,7 @@ export async function writeConfigFileFromContext(
   const snapshotRead = options.baseSnapshot
     ? {
         snapshot: options.baseSnapshot,
-        pluginMetadataSnapshot: options.basePluginMetadataSnapshot,
+        pluginMetadata: options.basePluginMetadataSnapshot?.manifestRegistry,
       }
     : await readSnapshot();
   const snapshot = snapshotRead.snapshot;

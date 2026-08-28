@@ -400,7 +400,7 @@ export async function runConfigOperations(params: {
   if (options.dryRun) {
     nextConfig = prepareConfigWriteTopology({
       snapshot,
-      pluginMetadataSnapshot: mutationStart.writeOptions.basePluginMetadataSnapshot,
+      pluginMetadata: mutationStart.writeOptions.basePluginMetadataSnapshot?.manifestRegistry,
       nextConfig,
       options: { explicitSetPaths: normalizedExplicitSetPaths },
       unsetPaths: resolveManagedUnsetPathsForWrite(unsetPaths),

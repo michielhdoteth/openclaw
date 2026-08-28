@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { listAgentEntries, tryResolveDefaultAgentId } from "../agents/agent-scope-config.js";
+import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { isRecord } from "../utils.js";
 import { pinSurvivorWorkspaceForRosterCollapse } from "./agent-workspace-roster-transition.js";
@@ -7,25 +8,22 @@ import { getConfigValueAtPath, setConfigValueAtPath } from "./config-paths.js";
 import { prepareAuthInheritanceOwnerForWrite } from "./io.auth-inheritance-owner.js";
 import { assertAutomaticBindingsWriteAllowed } from "./io.ownership-write-guard.js";
 import { prepareSessionStoreOwnershipForWrite } from "./io.session-store-owner.js";
-import type {
-  ConfigWriteOptions,
-  ReadConfigFileSnapshotWithPluginMetadataResult,
-} from "./io.types.js";
+import type { ConfigWriteOptions } from "./io.types.js";
 import { migratePersistedImplicitMainRoster } from "./legacy.roster.js";
-import type { OpenClawConfig } from "./types.js";
+import type { ConfigFileSnapshot, OpenClawConfig } from "./types.js";
 import { materializeLegacyAgentOwnershipForActiveChannelsResult } from "./validation.js";
 
 // Validation and commits share ownership preparation. Cron migration, runtime refresh,
 // and persistence remain in the committing writer.
-export function prepareConfigWriteTopology(
-  params: ReadConfigFileSnapshotWithPluginMetadataResult & {
-    nextConfig: OpenClawConfig;
-    options: Pick<ConfigWriteOptions, "explicitSetPaths" | "explicitSetValueSource">;
-    unsetPaths: readonly (readonly string[])[];
-    env: NodeJS.ProcessEnv;
-  },
-) {
-  const { snapshot, options, unsetPaths, env, pluginMetadataSnapshot } = params;
+export function prepareConfigWriteTopology(params: {
+  snapshot: ConfigFileSnapshot;
+  pluginMetadata?: PluginManifestRegistry;
+  nextConfig: OpenClawConfig;
+  options: Pick<ConfigWriteOptions, "explicitSetPaths" | "explicitSetValueSource">;
+  unsetPaths: readonly (readonly string[])[];
+  env: NodeJS.ProcessEnv;
+}) {
+  const { snapshot, options, unsetPaths, env, pluginMetadata } = params;
   let nextConfig = params.nextConfig;
   const sourceRosterMigration = migratePersistedImplicitMainRoster(
     snapshot.sourceConfigBeforeMigrations ?? snapshot.parsed,
@@ -97,7 +95,7 @@ export function prepareConfigWriteTopology(
         nextConfig,
         ownerAgentId,
         env,
-        pluginMetadataSnapshot?.manifestRegistry.plugins,
+        pluginMetadata?.plugins,
         { materializeSessionStore: sameFixedSessionStore, materializeWorkspace: true },
       )
     : { config: nextConfig, insertedPaths: [] };

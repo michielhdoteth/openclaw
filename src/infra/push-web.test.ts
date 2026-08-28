@@ -18,6 +18,7 @@ import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import {
   createWebPushVapidKeyPair,
   deleteWebPushApprovalDeliveryTargets,
+  findBoundWebPushSubscriptionByEndpoint,
   hashWebPushEndpoint,
   listBoundWebPushSubscriptions,
   listTerminalWebPushApprovalDeliveryIds,
@@ -26,6 +27,7 @@ import {
   prepareWebPushApprovalDeliveries,
   readPersistedVapidKeyPair,
   retainSuccessfulWebPushApprovalDeliveries,
+  setWebPushSubscriptionPreferences,
 } from "./push-web-store.js";
 import {
   broadcastWebPush,
@@ -36,6 +38,7 @@ import {
 } from "./push-web.js";
 
 let tmpDir: string;
+const defaultDevicePreferences = { enabled: true, label: "" };
 
 function insertPendingApproval(id: string): void {
   const inserted = insertOperatorApproval({
@@ -252,7 +255,12 @@ describe("subscription CRUD", () => {
     expect(tableHasColumn(database.db, "web_push_subscriptions", "device_id")).toBe(true);
     expect(tableHasColumn(database.db, "web_push_subscriptions", "user_profile_id")).toBe(true);
     expect(listBoundWebPushSubscriptions(tmpDir)).toEqual([
-      { ...subscription, deviceId: "browser-device", userProfileId: "profile-1" },
+      {
+        ...subscription,
+        deviceId: "browser-device",
+        userProfileId: "profile-1",
+        devicePreferences: defaultDevicePreferences,
+      },
     ]);
   });
 
@@ -267,7 +275,12 @@ describe("subscription CRUD", () => {
       baseDir: tmpDir,
     });
     expect(listBoundWebPushSubscriptions(tmpDir)).toEqual([
-      { ...rebound, deviceId: "browser-device", userProfileId: null },
+      {
+        ...rebound,
+        deviceId: "browser-device",
+        userProfileId: null,
+        devicePreferences: defaultDevicePreferences,
+      },
     ]);
   });
 
@@ -295,8 +308,49 @@ describe("subscription CRUD", () => {
         updatedAtMs: subscription.updatedAtMs + 1,
         deviceId: "browser-device",
         userProfileId: "profile-1",
+        devicePreferences: defaultDevicePreferences,
       },
     ]);
+  });
+
+  it("persists preferences only while the authenticated subscription binding still matches", async () => {
+    await registerWebPushSubscription({
+      endpoint,
+      keys,
+      binding: { deviceId: "browser-device", userProfileId: "profile-1" },
+      baseDir: tmpDir,
+    });
+    expect(
+      setWebPushSubscriptionPreferences({
+        endpoint,
+        expectedDeviceId: "different-device",
+        expectedUserProfileId: "profile-1",
+        preferences: { enabled: false, label: "Wrong" },
+        stateDir: tmpDir,
+      }),
+    ).toBe(false);
+    expect(
+      setWebPushSubscriptionPreferences({
+        endpoint,
+        expectedDeviceId: "browser-device",
+        expectedUserProfileId: "profile-1",
+        preferences: {
+          enabled: true,
+          label: "Slot 1",
+          categories: { agentQuestion: true },
+        },
+        stateDir: tmpDir,
+      }),
+    ).toBe(true);
+    expect(findBoundWebPushSubscriptionByEndpoint({ endpoint, stateDir: tmpDir })).toMatchObject({
+      deviceId: "browser-device",
+      userProfileId: "profile-1",
+      devicePreferences: {
+        enabled: true,
+        label: "Slot 1",
+        categories: { agentQuestion: true },
+      },
+    });
   });
 
   it("preserves unrelated concurrent registrations", async () => {
@@ -442,7 +496,9 @@ describe("approval delivery target persistence", () => {
       stateDir: tmpDir,
     });
     closeOpenClawStateDatabase();
-    expect(listWebPushApprovalDeliveryTargets({ approvalId, stateDir: tmpDir })).toEqual([first]);
+    expect(listWebPushApprovalDeliveryTargets({ approvalId, stateDir: tmpDir })).toEqual([
+      { ...firstBound, devicePreferences: defaultDevicePreferences },
+    ]);
 
     expect(
       resolveOperatorApproval({

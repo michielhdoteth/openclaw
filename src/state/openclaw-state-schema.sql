@@ -833,6 +833,7 @@ CREATE TABLE IF NOT EXISTS web_push_subscriptions (
   auth TEXT NOT NULL,
   device_id TEXT,
   user_profile_id TEXT,
+  preferences_json TEXT,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL
 ) STRICT;

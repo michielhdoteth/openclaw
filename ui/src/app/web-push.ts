@@ -1,14 +1,21 @@
+import type {
+  WebPushDevicePreferences,
+  WebPushNotificationPreferences,
+} from "../../../packages/gateway-protocol/src/schema/push.ts";
 // Application-owned browser push subscription lifecycle.
 import type { GatewayBrowserClient } from "../api/gateway.ts";
 import { formatUiError } from "../lib/format-error.ts";
 import type { ApplicationGateway } from "./gateway.ts";
+import type { WebPushPreferencesResult } from "./web-push.runtime.ts";
 
 type WebPushSnapshot = {
   supported: boolean;
+  unsupportedReason: "ios-install-required" | "browser-unsupported" | null;
   permission: NotificationPermission | "unsupported";
   subscribed: boolean;
   loading: boolean;
   error: string | null;
+  preferences: WebPushPreferencesResult | null;
 };
 
 export type WebPushCapability = {
@@ -17,10 +24,23 @@ export type WebPushCapability = {
   enable: () => Promise<void>;
   disable: () => Promise<void>;
   sendTest: () => Promise<void>;
+  setUserPreferences: (preferences: WebPushNotificationPreferences) => Promise<void>;
+  setDevicePreferences: (preferences: WebPushDevicePreferences) => Promise<void>;
   dispose: () => void;
 };
 
+function isIosStandalone(nav: Navigator): boolean {
+  // SAFETY: iOS Safari's non-standard standalone flag is optional and read-only.
+  return Boolean((nav as Navigator & { standalone?: boolean }).standalone);
+}
+
 function isWebPushSupported(): boolean {
+  const nav = typeof navigator === "undefined" ? undefined : navigator;
+  const ios = Boolean(nav && /iPad|iPhone|iPod/u.test(nav.userAgent));
+  const standalone = Boolean(nav && "standalone" in nav && isIosStandalone(nav));
+  if (ios && !standalone) {
+    return false;
+  }
   return (
     typeof navigator !== "undefined" &&
     "serviceWorker" in navigator &&
@@ -32,12 +52,24 @@ function isWebPushSupported(): boolean {
 
 export function createWebPushCapability(gateway: ApplicationGateway): WebPushCapability {
   const supported = isWebPushSupported();
+  const nav = typeof navigator === "undefined" ? undefined : navigator;
+  const iosInstallRequired = Boolean(
+    nav &&
+    /iPad|iPhone|iPod/u.test(nav.userAgent) &&
+    !("standalone" in nav && isIosStandalone(nav)),
+  );
   let snapshot: WebPushSnapshot = {
     supported,
+    unsupportedReason: supported
+      ? null
+      : iosInstallRequired
+        ? "ios-install-required"
+        : "browser-unsupported",
     permission: supported ? Notification.permission : "unsupported",
     subscribed: false,
     loading: false,
     error: null,
+    preferences: null,
   };
   let disposed = false;
   let connectedClient: GatewayBrowserClient | null = null;
@@ -76,8 +108,14 @@ export function createWebPushCapability(gateway: ApplicationGateway): WebPushCap
       ) {
         return;
       }
+      let preferences: WebPushPreferencesResult | null = null;
+      if (result.state === "registered") {
+        const { getWebPushPreferences } = await import("./web-push.runtime.ts");
+        preferences = await getWebPushPreferences(client);
+      }
       publish({
         subscribed: result.state !== "missing",
+        preferences,
         error: result.state === "vapid-mismatch" ? result.error : null,
       });
     } catch (error) {
@@ -141,18 +179,29 @@ export function createWebPushCapability(gateway: ApplicationGateway): WebPushCap
       run(async (client) => {
         const { subscribeToWebPush } = await import("./web-push.runtime.ts");
         await subscribeToWebPush(client);
-        publish({ subscribed: true });
+        const { getWebPushPreferences } = await import("./web-push.runtime.ts");
+        publish({ subscribed: true, preferences: await getWebPushPreferences(client) });
       }),
     disable: () =>
       run(async (client) => {
         const { unsubscribeFromWebPush } = await import("./web-push.runtime.ts");
         await unsubscribeFromWebPush(client);
-        publish({ subscribed: false });
+        publish({ subscribed: false, preferences: null });
       }),
     sendTest: () =>
       run(async (client) => {
         const { sendTestWebPush } = await import("./web-push.runtime.ts");
         await sendTestWebPush(client);
+      }),
+    setUserPreferences: (preferences) =>
+      run(async (client) => {
+        const { setWebPushPreferences } = await import("./web-push.runtime.ts");
+        publish({ preferences: await setWebPushPreferences(client, "user", preferences) });
+      }),
+    setDevicePreferences: (preferences) =>
+      run(async (client) => {
+        const { setWebPushPreferences } = await import("./web-push.runtime.ts");
+        publish({ preferences: await setWebPushPreferences(client, "device", preferences) });
       }),
     dispose() {
       disposed = true;

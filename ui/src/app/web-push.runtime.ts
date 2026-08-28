@@ -1,3 +1,7 @@
+import type {
+  WebPushDevicePreferences,
+  WebPushNotificationPreferences,
+} from "../../../packages/gateway-protocol/src/schema/push.ts";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
 
 const SW_READY_TIMEOUT = 10_000;
@@ -8,6 +12,13 @@ type WebPushReconcileResult =
   | { state: "missing" }
   | { state: "registered" }
   | { state: "vapid-mismatch"; error: string };
+
+export type WebPushPreferencesResult = {
+  durableIdentity: boolean;
+  user: WebPushNotificationPreferences;
+  device: WebPushDevicePreferences;
+  effective: WebPushNotificationPreferences & { enabled: boolean; label: string };
+};
 
 function swReady(): Promise<ServiceWorkerRegistration> {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -22,6 +33,21 @@ function swReady(): Promise<ServiceWorkerRegistration> {
       clearTimeout(timeoutId);
     }
   });
+}
+
+function pushManagerFor(registration: ServiceWorkerRegistration): PushManager | null {
+  const manager = registration.pushManager;
+  return manager && typeof manager.getSubscription === "function" ? manager : null;
+}
+
+function requirePushManager(registration: ServiceWorkerRegistration): PushManager {
+  const manager = pushManagerFor(registration);
+  if (!manager || typeof manager.subscribe !== "function") {
+    throw new Error(
+      "Web Push is unavailable in this browser. On iPhone or iPad, add OpenClaw to the Home Screen and open the installed app.",
+    );
+  }
+  return manager;
 }
 
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
@@ -40,7 +66,7 @@ export async function getExistingSubscription(): Promise<PushSubscription | null
     return null;
   }
   const registration = await swReady();
-  return await registration.pushManager.getSubscription();
+  return (await pushManagerFor(registration)?.getSubscription()) ?? null;
 }
 
 async function resolveGatewayVapidPublicKey(client: GatewayBrowserClient): Promise<Uint8Array> {
@@ -123,8 +149,9 @@ export async function subscribeToWebPush(
   }
 
   const registration = await swReady();
+  const pushManager = requirePushManager(registration);
   const vapidPublicKey = await resolveGatewayVapidPublicKey(client);
-  const existingSubscription = await registration.pushManager.getSubscription();
+  const existingSubscription = await pushManager.getSubscription();
   if (existingSubscription) {
     if (!subscriptionUsesVapidKey(existingSubscription, vapidPublicKey)) {
       await clearMismatchedGatewaySubscription(client, existingSubscription);
@@ -132,7 +159,7 @@ export async function subscribeToWebPush(
     }
     return await registerPushSubscription(client, existingSubscription);
   }
-  const pushSubscription = await registration.pushManager.subscribe({
+  const pushSubscription = await pushManager.subscribe({
     userVisibleOnly: true,
     applicationServerKey: vapidPublicKey.buffer as ArrayBuffer,
   });
@@ -151,7 +178,7 @@ export async function subscribeToWebPush(
 
 export async function unsubscribeFromWebPush(client: GatewayBrowserClient): Promise<void> {
   const registration = await swReady();
-  const subscription = await registration.pushManager.getSubscription();
+  const subscription = (await pushManagerFor(registration)?.getSubscription()) ?? null;
   if (!subscription) {
     return;
   }
@@ -167,4 +194,37 @@ export async function unsubscribeFromWebPush(client: GatewayBrowserClient): Prom
 
 export async function sendTestWebPush(client: GatewayBrowserClient): Promise<void> {
   await client.request("push.web.test", {});
+}
+
+async function requireExistingSubscription(): Promise<PushSubscription> {
+  const subscription = await getExistingSubscription();
+  if (!subscription) {
+    throw new Error("Enable notifications before changing notification preferences.");
+  }
+  return subscription;
+}
+
+export async function getWebPushPreferences(
+  client: GatewayBrowserClient,
+): Promise<WebPushPreferencesResult> {
+  const subscription = await requireExistingSubscription();
+  const result = await client.request("push.web.preferences.get", {
+    endpoint: subscription.endpoint,
+  });
+  // SAFETY: the Gateway validates and owns the closed preferences result contract.
+  return result as WebPushPreferencesResult;
+}
+
+export async function setWebPushPreferences(
+  client: GatewayBrowserClient,
+  scope: "user" | "device",
+  preferences: WebPushNotificationPreferences | WebPushDevicePreferences,
+): Promise<WebPushPreferencesResult> {
+  const subscription = await requireExistingSubscription();
+  await client.request("push.web.preferences.set", {
+    endpoint: subscription.endpoint,
+    scope,
+    preferences,
+  });
+  return await getWebPushPreferences(client);
 }

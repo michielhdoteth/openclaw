@@ -1391,6 +1391,10 @@ export class ConfigPage extends OpenClawLightDomElement {
       onWebPushSubscribe: () => void this.context.webPush.enable(),
       onWebPushUnsubscribe: () => void this.context.webPush.disable(),
       onWebPushTest: () => void this.context.webPush.sendTest(),
+      onWebPushSetUserPreferences: (preferences) =>
+        void this.context.webPush.setUserPreferences(preferences),
+      onWebPushSetDevicePreferences: (preferences) =>
+        void this.context.webPush.setDevicePreferences(preferences),
     };
     if (this.pageId === "mcp") {
       return renderMcp({

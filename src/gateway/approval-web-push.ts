@@ -1,6 +1,7 @@
 // Delivers generic approval notifications to Web Push subscriptions whose
 // persisted browser binding still has current approval and visibility access.
 import { createHash } from "node:crypto";
+import { normalizeOptionalString } from "@openclaw/normalization-core";
 import {
   GATEWAY_CLIENT_IDS,
   GATEWAY_CLIENT_MODES,
@@ -13,6 +14,13 @@ import {
   type PairedDevice,
 } from "../infra/device-pairing.js";
 import {
+  WEB_PUSH_USER_PREFERENCES_KEY,
+  isWebPushQuietHours,
+  resolveEffectiveWebPushPreferences,
+  webPushAgentAllowed,
+  webPushCategoryEnabled,
+} from "../infra/push-web-preferences.js";
+import {
   deleteWebPushApprovalDeliveryTargets,
   listBoundWebPushSubscriptions,
   listTerminalWebPushApprovalDeliveryIds,
@@ -23,6 +31,7 @@ import {
   type BoundWebPushSubscription,
 } from "../infra/push-web.js";
 import { roleScopesAllow } from "../shared/operator-scope-compat.js";
+import { getUserPreferences } from "../state/user-preferences.js";
 import { resolveUserProfileId } from "../state/user-profiles.js";
 import { normalizeControlUiBasePath } from "./control-ui-shared.js";
 import type { ExecApprovalRecord } from "./exec-approval-manager.js";
@@ -35,6 +44,10 @@ import type { GatewayClient } from "./server-methods/types.js";
 const OPERATOR_ROLE = "operator";
 const WEB_PUSH_APPROVAL_TIMEOUT_MS = 10_000;
 const WEB_PUSH_TERMINAL_TTL_SECONDS = 5 * 60;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
 
 type CurrentApprovalWebPushTarget = {
   subscription: BoundWebPushSubscription;
@@ -50,6 +63,51 @@ type ApprovalRequestWebPushDelivery = {
   cfg: OpenClawConfig;
   sender: PreparedWebPushNotificationSender;
 };
+
+function approvalPreferences(params: {
+  subscription: BoundWebPushSubscription;
+  stateDir?: string;
+}) {
+  const profileId = params.subscription.userProfileId
+    ? resolveUserProfileId(params.subscription.userProfileId)
+    : undefined;
+  const storedUser = profileId
+    ? getUserPreferences(
+        profileId,
+        [WEB_PUSH_USER_PREFERENCES_KEY],
+        params.stateDir ? { env: { ...process.env, OPENCLAW_STATE_DIR: params.stateDir } } : {},
+      )[WEB_PUSH_USER_PREFERENCES_KEY]
+    : undefined;
+  return resolveEffectiveWebPushPreferences({
+    user: storedUser,
+    device: params.subscription.devicePreferences,
+  });
+}
+
+function approvalNotificationCopy(params: {
+  terminal: boolean;
+  preferences: ReturnType<typeof approvalPreferences>;
+  agentId?: string;
+}) {
+  const label = params.preferences.label ? `${params.preferences.label} · ` : "";
+  const agent = params.agentId ? ` for ${params.agentId}` : "";
+  if (params.terminal) {
+    return {
+      title: `${label}OpenClaw approval updated`,
+      body:
+        params.preferences.detailLevel === "private"
+          ? "This approval is no longer pending."
+          : `Approval${agent} is no longer pending.`,
+    };
+  }
+  return {
+    title: `${label}OpenClaw approval requested`,
+    body:
+      params.preferences.detailLevel === "private"
+        ? "Open OpenClaw to review this request."
+        : `Open OpenClaw to review an approval${agent}.`,
+  };
+}
 
 type ApprovalWebPushDeliveryState = {
   requestPushPromise: Promise<ApprovalRequestWebPushDelivery | null>;
@@ -188,8 +246,16 @@ async function deliverBoundApprovalWebPush<TPayload>(params: {
       device: pairedByDeviceId.get(subscription.deviceId),
       cfg: params.cfg,
     });
+    if (!target) {
+      return false;
+    }
+    const preferences = approvalPreferences({ subscription, stateDir: params.stateDir });
+    const source = isRecord(params.record.request) ? params.record.request : undefined;
+    const agentId = normalizeOptionalString(source?.agentId);
     return Boolean(
-      target &&
+      webPushCategoryEnabled(preferences, "approval-requested") &&
+      !isWebPushQuietHours(preferences) &&
+      webPushAgentAllowed(preferences, agentId) &&
       isApprovalRecordVisibleToClient({
         record: params.record,
         client: approvalWebPushClient(target),
@@ -220,23 +286,41 @@ async function deliverBoundApprovalWebPush<TPayload>(params: {
     return null;
   }
   const ttlSeconds = Math.ceil((params.record.expiresAtMs - now) / 1_000);
-  const results = await sendWebPushNotifications({
-    subscriptions,
-    payload: {
-      title: "OpenClaw approval requested",
-      body: "Open OpenClaw to review this request.",
-      renotify: false,
-      tag: approvalWebPushTag(params.record.id),
-      url: approvalWebPushUrl(params.cfg, params.record.id),
-    },
-    // Approval prompts expire quickly and should not surface after the decision window.
-    deliveryOptions: {
-      TTL: ttlSeconds,
-      urgency: "high",
-      timeout: WEB_PUSH_APPROVAL_TIMEOUT_MS,
-      topic: approvalWebPushTopic(params.record.id),
-    },
-  });
+  const source = isRecord(params.record.request) ? params.record.request : undefined;
+  const agentId = normalizeOptionalString(source?.agentId);
+  const requestGroups = new Map<
+    string,
+    { copy: ReturnType<typeof approvalNotificationCopy>; subscriptions: BoundWebPushSubscription[] }
+  >();
+  for (const subscription of subscriptions) {
+    const preferences = approvalPreferences({ subscription, stateDir: params.stateDir });
+    const copy = approvalNotificationCopy({ terminal: false, preferences, agentId });
+    const key = JSON.stringify(copy);
+    const group = requestGroups.get(key) ?? { copy, subscriptions: [] };
+    group.subscriptions.push(subscription);
+    requestGroups.set(key, group);
+  }
+  const results = (
+    await Promise.all(
+      [...requestGroups.values()].map(async ({ copy, subscriptions: groupedSubscriptions }) => {
+        return await sendWebPushNotifications({
+          subscriptions: groupedSubscriptions,
+          payload: {
+            ...copy,
+            renotify: false,
+            tag: approvalWebPushTag(params.record.id),
+            url: approvalWebPushUrl(params.cfg, params.record.id),
+          },
+          deliveryOptions: {
+            TTL: ttlSeconds,
+            urgency: "high",
+            timeout: WEB_PUSH_APPROVAL_TIMEOUT_MS,
+            topic: approvalWebPushTopic(params.record.id),
+          },
+        });
+      }),
+    )
+  ).flat();
   const deliveredSubscriptionIds = new Set(
     results.filter((result) => result.ok).map((result) => result.subscriptionId),
   );
@@ -280,35 +364,65 @@ export function createApprovalWebPushDelivery(params: {
         return;
       }
       const cfg = requestDelivery?.cfg ?? params.getRuntimeConfig();
-      const results = await sender({
-        subscriptions,
-        payload: {
-          title: "OpenClaw approval updated",
-          body: "This approval is no longer pending.",
-          renotify: false,
-          tag: approvalWebPushTag(approval.id),
-          url: approvalWebPushUrl(cfg, approval.id),
-        },
-        // A terminal replacement stays visible per Push API requirements while
-        // the shared topic collapses any queued request notification.
-        deliveryOptions: {
-          TTL: WEB_PUSH_TERMINAL_TTL_SECONDS,
-          urgency: "high",
-          timeout: WEB_PUSH_APPROVAL_TIMEOUT_MS,
-          topic: approvalWebPushTopic(approval.id),
-        },
-      });
+      const terminalGroups = new Map<
+        string,
+        {
+          copy: ReturnType<typeof approvalNotificationCopy>;
+          subscriptions: BoundWebPushSubscription[];
+        }
+      >();
+      const suppressedSubscriptionIds: string[] = [];
+      for (const subscription of subscriptions) {
+        const preferences = approvalPreferences({ subscription, stateDir: params.stateDir });
+        if (
+          !webPushCategoryEnabled(preferences, "approval-resolved") ||
+          isWebPushQuietHours(preferences)
+        ) {
+          suppressedSubscriptionIds.push(subscription.subscriptionId);
+          continue;
+        }
+        const copy = approvalNotificationCopy({ terminal: true, preferences });
+        const key = JSON.stringify(copy);
+        const group = terminalGroups.get(key) ?? { copy, subscriptions: [] };
+        group.subscriptions.push(subscription);
+        terminalGroups.set(key, group);
+      }
+      const results = (
+        await Promise.all(
+          [...terminalGroups.values()].map(
+            async ({ copy, subscriptions: groupedSubscriptions }) => {
+              return await sender({
+                subscriptions: groupedSubscriptions,
+                payload: {
+                  ...copy,
+                  renotify: false,
+                  tag: approvalWebPushTag(approval.id),
+                  url: approvalWebPushUrl(cfg, approval.id),
+                },
+                deliveryOptions: {
+                  TTL: WEB_PUSH_TERMINAL_TTL_SECONDS,
+                  urgency: "high",
+                  timeout: WEB_PUSH_APPROVAL_TIMEOUT_MS,
+                  topic: approvalWebPushTopic(approval.id),
+                },
+              });
+            },
+          ),
+        )
+      ).flat();
       const successfulSubscriptionIds = results
         .filter((result) => result.ok)
         .map((result) => result.subscriptionId);
       deleteWebPushApprovalDeliveryTargets({
         approvalId: approval.id,
-        subscriptionIds: successfulSubscriptionIds,
+        subscriptionIds: [...successfulSubscriptionIds, ...suppressedSubscriptionIds],
         stateDir: params.stateDir,
       });
-      if (successfulSubscriptionIds.length < subscriptions.length) {
+      const completedSubscriptionCount =
+        successfulSubscriptionIds.length + suppressedSubscriptionIds.length;
+      if (completedSubscriptionCount < subscriptions.length) {
         params.log?.warn?.(
-          `approval Web Push terminal replacement reached ${successfulSubscriptionIds.length}/${subscriptions.length} browsers approvalId=${approval.id}`,
+          `approval Web Push terminal replacement reached ${successfulSubscriptionIds.length}/${subscriptions.length - suppressedSubscriptionIds.length} eligible browsers approvalId=${approval.id}`,
         );
       }
     })();

@@ -21,6 +21,7 @@ import {
   tablePrimaryKeyColumns,
 } from "./openclaw-state-db-schema-helpers.js";
 import { OpenClawStateDatabaseSchemaMigrationRequiredError } from "./openclaw-state-db-schema-migration-required.js";
+import { rebuildCanonicalStateTable } from "./openclaw-state-db-schema-rebuild.js";
 import { FOLDED_SINGLETON_STATE_TABLES_V12 } from "./openclaw-state-db-schema-v12-foldin.js";
 import * as sessionWatchMigration from "./openclaw-state-db-session-watch-migration.js";
 import {
@@ -130,6 +131,25 @@ export function migrateWorkerPlacementExecutionModeSchema(
   );
   db.exec("DROP TABLE worker_session_placements;");
   db.exec(`ALTER TABLE ${migrationTable} RENAME TO worker_session_placements;`);
+  return true;
+}
+
+export function migrateGitHubPublicationBranches(
+  db: DatabaseSync,
+  previousVersion: number,
+): boolean {
+  if (
+    previousVersion >= 14 ||
+    !tableExists(db, "github_publication_requests") ||
+    tableHasColumn(db, "github_publication_requests", "source_branch")
+  ) {
+    return false;
+  }
+  // Older records used one branch for both identities. Backfill before rebuilding
+  // NOT NULL so queued work and already-published destinations survive unchanged.
+  db.exec("ALTER TABLE github_publication_requests ADD COLUMN source_branch TEXT;");
+  db.exec("UPDATE github_publication_requests SET source_branch = branch;");
+  rebuildCanonicalStateTable(db, "github_publication_requests", 14);
   return true;
 }
 
@@ -398,6 +418,13 @@ export function detectOpenClawStateDatabaseSchemaMigrationsFromDatabase(
       tableExists(db, "auth_profile_stores"))
   ) {
     migrations.push({ kind: "state-consolidation-v13", path: pathname });
+  }
+  if (
+    userVersion < 14 &&
+    tableExists(db, "github_publication_requests") &&
+    !tableHasColumn(db, "github_publication_requests", "source_branch")
+  ) {
+    migrations.push({ kind: "github-publication-branches-v14", path: pathname });
   }
   if (!hasCanonicalAgentDatabasesPrimaryKey(db)) {
     migrations.push({ kind: "agent-databases-composite-primary-key", path: pathname });

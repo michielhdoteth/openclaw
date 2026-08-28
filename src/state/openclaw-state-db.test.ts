@@ -2259,7 +2259,9 @@ describe("openclaw state database", () => {
       }
 
       const migrated = openOpenClawStateDatabase(options);
-      expect(readSqliteNumberPragma(migrated.db, "user_version")).toBe(13);
+      expect(readSqliteNumberPragma(migrated.db, "user_version")).toBe(
+        OPENCLAW_STATE_SCHEMA_VERSION,
+      );
       expect(collectSqliteSchemaShape(migrated.db).gateway_origin_device_tokens).toEqual(
         createInitialStateSchemaShape().gateway_origin_device_tokens,
       );
@@ -2590,7 +2592,7 @@ describe("openclaw state database", () => {
       });
       closeOpenClawStateDatabaseForTest();
       expect(readSqliteNumberPragma(openOpenClawStateDatabase(options).db, "user_version")).toBe(
-        13,
+        OPENCLAW_STATE_SCHEMA_VERSION,
       );
     },
   );
@@ -2858,7 +2860,7 @@ describe("openclaw state database", () => {
             }).db,
             "user_version",
           ),
-        ).toBe(13);
+        ).toBe(OPENCLAW_STATE_SCHEMA_VERSION);
       },
     );
   });
@@ -2894,7 +2896,7 @@ describe("openclaw state database", () => {
         db.prepare("UPDATE cron_jobs SET state_json = '[]'").run();
         expect(() => db.exec(STATE_SCHEMA_13_TO_12_DOWNGRADE_SQL)).toThrow(/CHECK constraint/);
         db.exec("ROLLBACK");
-        expect(readSqliteNumberPragma(db, "user_version")).toBe(13);
+        expect(readSqliteNumberPragma(db, "user_version")).toBe(OPENCLAW_STATE_SCHEMA_VERSION);
         expect(db.prepare("SELECT state_json FROM cron_jobs").get()).toEqual({ state_json: "[]" });
         db.close();
       },
@@ -2922,7 +2924,7 @@ describe("openclaw state database", () => {
     legacy.close();
 
     const migrated = openOpenClawStateDatabase(options);
-    expect(readSqliteNumberPragma(migrated.db, "user_version")).toBe(13);
+    expect(readSqliteNumberPragma(migrated.db, "user_version")).toBe(OPENCLAW_STATE_SCHEMA_VERSION);
     expect(
       migrated.db
         .prepare(
@@ -4623,6 +4625,111 @@ INSERT INTO macos_port_guardian_records VALUES (4242, 18789, '/usr/bin/ssh', 're
       assertOpenClawStateDatabaseForMaintenance(reopened.db, { pathname: reopened.path }),
     ).not.toThrow();
   });
+
+  it.each(["runtime open", "doctor repair"] as const)(
+    "preserves v13 publication identities through %s and freezes distinct destinations on reopen",
+    (migrationPath) => {
+      const stateDir = createTempStateDir();
+      const databasePath = materializeCurrentStateDatabase(stateDir);
+      const options = { env: { OPENCLAW_STATE_DIR: stateDir } };
+      const { DatabaseSync } = requireNodeSqlite();
+      const previous = new DatabaseSync(databasePath);
+      const publicationStart = OPENCLAW_STATE_SCHEMA_SQL.indexOf(
+        "CREATE TABLE IF NOT EXISTS github_publication_requests (",
+      );
+      const publicationEnd = OPENCLAW_STATE_SCHEMA_SQL.indexOf("\n) STRICT;", publicationStart);
+      const previousPublicationSchema = OPENCLAW_STATE_SCHEMA_SQL.slice(
+        publicationStart,
+        publicationEnd + "\n) STRICT;".length,
+      ).replace("  source_branch TEXT NOT NULL,\n", "");
+      previous.exec(`DROP TABLE github_publication_requests; ${previousPublicationSchema}`);
+      previous.exec(`
+        PRAGMA user_version = 13;
+        UPDATE schema_meta SET schema_version = 13 WHERE meta_key = 'primary';
+        INSERT INTO github_publication_requests (
+          request_id, idempotency_key, request_digest, session_id, session_key,
+          agent_id, worktree_id, repository_fingerprint, identity_source,
+          identity_account_id, identity_login, status, branch, created_at_ms, updated_at_ms
+        ) VALUES (
+          'pending-publication', 'pending-key', 'pending-digest', 'pending-session',
+          'agent:main:pending', 'main', 'pending-worktree', 'pending-repo',
+          'system-detected', 1, 'example', 'requested', 'openclaw/brisk-lobster', 10, 20
+        );
+        INSERT INTO github_publication_requests (
+          request_id, idempotency_key, request_digest, session_id, session_key,
+          agent_id, worktree_id, repository_fingerprint, identity_source,
+          identity_account_id, identity_login, status, branch, pull_request_url,
+          created_at_ms, updated_at_ms
+        ) VALUES (
+          'published-publication', 'published-key', 'published-digest', 'published-session',
+          'agent:main:published', 'main', 'published-worktree', 'published-repo',
+          'system-detected', 1, 'example', 'published', 'custom-branch',
+          'https://github.com/example/repo/pull/1', 10, 30
+        );
+      `);
+      const previousRows = previous
+        .prepare("SELECT * FROM github_publication_requests ORDER BY request_id")
+        .all();
+      previous.close();
+      for (const row of previousRows) {
+        if (typeof row.branch !== "string") {
+          throw new Error("Publication fixture must have a branch");
+        }
+        row.source_branch = row.branch;
+      }
+
+      expect(detectOpenClawStateDatabaseSchemaMigrations(options)).toEqual([
+        { kind: "github-publication-branches-v14", path: databasePath },
+      ]);
+      if (migrationPath === "doctor repair") {
+        expect(repairOpenClawStateDatabaseSchema(options)).toEqual({
+          changes: ["Separated GitHub publication source and destination branches (v14)"],
+          warnings: [],
+        });
+      }
+      const migrated = openOpenClawStateDatabase(options);
+      expect(
+        migrated.db.prepare("SELECT * FROM github_publication_requests ORDER BY request_id").all(),
+      ).toEqual(previousRows);
+      expect(readSqliteNumberPragma(migrated.db, "user_version")).toBe(14);
+      expect(
+        migrated.db
+          .prepare("SELECT schema_version FROM schema_meta WHERE meta_key = 'primary'")
+          .get(),
+      ).toEqual({ schema_version: 14 });
+      expect(() =>
+        migrated.db.prepare("UPDATE github_publication_requests SET source_branch = NULL").run(),
+      ).toThrow(/NOT NULL constraint/);
+      migrated.db
+        .prepare("UPDATE github_publication_requests SET branch = ? WHERE request_id = ?")
+        .run("openclaw/fix-sidebar-branch-naming", "pending-publication");
+      closeOpenClawStateDatabaseForTest();
+
+      const reopened = openOpenClawStateDatabase(options);
+      expect(
+        reopened.db
+          .prepare(
+            "SELECT request_id, source_branch, branch FROM github_publication_requests ORDER BY request_id",
+          )
+          .all(),
+      ).toEqual([
+        {
+          request_id: "pending-publication",
+          source_branch: "openclaw/brisk-lobster",
+          branch: "openclaw/fix-sidebar-branch-naming",
+        },
+        {
+          request_id: "published-publication",
+          source_branch: "custom-branch",
+          branch: "custom-branch",
+        },
+      ]);
+      expect(() =>
+        assertOpenClawStateDatabaseForMaintenance(reopened.db, { pathname: databasePath }),
+      ).not.toThrow();
+      expect(detectOpenClawStateDatabaseSchemaMigrations(options)).toEqual([]);
+    },
+  );
 
   it("keeps GitHub publication lazy across current-schema open, first use, and reopen", async () => {
     const stateDir = createTempStateDir();

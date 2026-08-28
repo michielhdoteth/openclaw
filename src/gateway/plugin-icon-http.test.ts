@@ -1,11 +1,11 @@
 // Gateway plugin icon HTTP tests cover authenticated identity lookup, bounded
 // remote loading, SVG normalization, caching, and failure fallback behavior.
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 
 const mocks = vi.hoisted(() => ({
   authorize: vi.fn(),
@@ -52,7 +52,8 @@ const PNG_BYTES = Buffer.from(
   "base64",
 );
 const NORMALIZED_PNG_BYTES = Buffer.from("normalized-png");
-const iconFixtureDir = mkdtempSync(path.join(tmpdir(), "openclaw-plugin-icon-"));
+const tempRoots = useAutoCleanupTempDirTracker(afterAll);
+const iconFixtureDir = tempRoots.make("openclaw-plugin-icon-");
 const localIconPath = path.join(iconFixtureDir, "icon.png");
 writeFileSync(localIconPath, PNG_BYTES);
 const ICO_BYTES = Buffer.from([
@@ -106,7 +107,6 @@ afterAll(async () => {
   await new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
-  rmSync(iconFixtureDir, { recursive: true, force: true });
 });
 
 beforeEach(() => {

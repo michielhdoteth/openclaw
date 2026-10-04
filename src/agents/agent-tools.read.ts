@@ -714,6 +714,10 @@ async function appendMemoryFlushContent(params: {
     const next = `${existing}${separator}${params.content}`;
     const parent = path.posix.dirname(params.relativePath);
     if (parent && parent !== ".") {
+      // Recheck authority immediately before creating the parent directory: the
+      // queued read above awaits sandbox I/O, so a receipt revoked while queued
+      // must not be able to create a directory before the write is rejected.
+      params.assertCurrent();
       await sandbox.bridge.mkdirp({
         filePath: parent,
         cwd: sandbox.root,
